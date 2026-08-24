@@ -72,3 +72,48 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build-san --output-on-failure
+
+  schema:
+    name: Database schema
+    runs-on: ubuntu-22.04
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ledger
+          POSTGRES_PASSWORD: ledger_dev_password
+          POSTGRES_DB: ledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ledger -d ledger"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      PGPASSWORD: ledger_dev_password
+      PSQL: psql -h localhost -p 5432 -U ledger -d ledger
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install psql
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Apply migrations
+        run: |
+          for f in db/migrations/*.sql; do
+            echo "apply $f"
+            $PSQL -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - name: Load dev seed
+        run: $PSQL -v ON_ERROR_STOP=1 -q -f db/seeds/dev_seed.sql
+
+      - name: Constraint tests
+        run: $PSQL -f db/checks/constraint_tests.sql
+
+      - name: Invariant checks
+        run: $PSQL -f db/checks/invariants.sql

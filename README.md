@@ -5,8 +5,8 @@ multi-currency account transfers over a hand-rolled epoll event loop, prevents
 double-spending under concurrent load, and guarantees that every transfer is
 recorded as a balanced pair of immutable journal entries.
 
-> **Status:** Stage 1 of 9 — project skeleton builds, runs, and tests clean.
-> See [Roadmap](#roadmap) for what is done and what is next.
+> **Status:** Stage 2 of 9 — schema is live and enforces double-entry at the
+> database level. See [Roadmap](#roadmap) for what is done and what is next.
 
 ---
 
@@ -100,6 +100,41 @@ Expected output from `make test`:
 
 `make help` lists every available target.
 
+## The schema enforces the ledger, not just stores it
+
+Most of the double-entry rules live in the database rather than in application
+code, because application code can be bypassed — by a stray `psql` session, a
+data-fixing script, or a new code path that forgot to check.
+
+| Rule | How it is enforced |
+|---|---|
+| A transaction has exactly two entries summing to zero | `DEFERRABLE INITIALLY DEFERRED` constraint trigger, checked at `COMMIT` |
+| Both legs share a currency | Composite FK to `accounts (id, currency)` — a cross-currency row has no parent to reference |
+| An entry's currency matches its account | Same composite FK, from `entries` |
+| The audit trail is immutable | `BEFORE UPDATE`/`BEFORE DELETE` triggers reject every mutation on `entries` |
+| A resent request cannot double-charge | `UNIQUE (idempotency_key)` on `transactions` |
+| A user balance cannot go negative | `CHECK (allow_negative OR balance >= 0)` |
+| An account cannot transfer to itself | `CHECK (debit_account_id <> credit_account_id)` |
+
+The deferred trigger is the interesting one. `CHECK` constraints see a single
+row, but "these two rows sum to zero" spans rows — and the two entries arrive in
+separate `INSERT`s, so an immediate check would fire while the transaction is
+legitimately half-written. Deferring it to commit time is what makes the rule
+expressible at all.
+
+```bash
+make db-all      # reset schema, load seed, run 22 constraint tests, check invariants
+make db-check    # invariant health check on whatever data is currently there
+make psql        # interactive session
+```
+
+`make db-test` writes deliberately invalid data 22 different ways and asserts
+the database rejects every one. `make db-check` asks the opposite question — is
+the data that is already there still consistent? Constraints only catch the
+error shapes they know about; a lost update writes rows that are individually
+valid and only wrong in relation to each other, which is why **I2** compares
+each balance snapshot against the sum of its entries.
+
 ## Development
 
 ```bash
@@ -128,8 +163,8 @@ anywhere else.
 |---|---|---|
 | 0 | Architecture design, module split, thread model | ✅ Done |
 | 1 | Project skeleton, CMake, Docker Compose | ✅ Done |
-| 2 | DB schema: `currencies` / `accounts` / `transactions` / `entries` | ⬜ Next |
-| 3 | Ledger core — in-memory, `shared_mutex`, no DB yet | ⬜ |
+| 2 | DB schema: `currencies` / `accounts` / `transactions` / `entries` | ✅ Done |
+| 3 | Ledger core — in-memory, `shared_mutex`, no DB yet | ⬜ Next |
 | 4 | epoll TCP server (echo first) | ⬜ |
 | 5 | Wire protocol framing + thread pool | ⬜ |
 | 6 | PostgreSQL integration with `SELECT … FOR UPDATE` | ⬜ |
