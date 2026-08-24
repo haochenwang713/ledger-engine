@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------------------
+# 開發用容器。
+#
+# 為什麼一定要有這個：epoll 是 Linux 專屬 API，macOS 上根本沒有 <sys/epoll.h>。
+# 這個專案的網路層規格指定 epoll，所以在 Mac 上必須進容器才能建置與執行。
+#
+# 用法（在專案根目錄）：
+#   docker compose up -d --build
+#   docker compose exec engine bash
+# ---------------------------------------------------------------------------
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      ninja-build \
+      git \
+      pkg-config \
+      # PostgreSQL client + libpqxx（Stage 6 才會用到，先裝好省事）
+      libpq-dev \
+      libpqxx-dev \
+      postgresql-client \
+      # 測試
+      libgtest-dev \
+      # 開發工具
+      gdb \
+      clang-format \
+      clang-tidy \
+      linux-tools-common \
+      curl \
+      ca-certificates \
+      vim \
+      less \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu 22.04 的 libgtest-dev 只給原始碼，需要自己編出 .a 檔。
+# 這一步做完，CMake 的 find_package(GTest) 就找得到，不必走 FetchContent 下載。
+RUN cmake -S /usr/src/googletest -B /tmp/gtest-build \
+      -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build /tmp/gtest-build -j"$(nproc)" \
+ && cmake --install /tmp/gtest-build \
+ && rm -rf /tmp/gtest-build
+
+WORKDIR /workspace
+
+# 容器保持存活，方便 docker compose exec 進來工作。
+CMD ["sleep", "infinity"]

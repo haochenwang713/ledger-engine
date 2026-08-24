@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------------
+# 開發環境：一個 Postgres 16 + 一個 Ubuntu 22.04 建置容器。
+#
+#   docker compose up -d --build     啟動
+#   docker compose exec engine bash  進到建置容器
+#   docker compose down -v           關閉並清掉資料（-v 會刪除 volume）
+# ---------------------------------------------------------------------------
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: ledger_postgres
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger_dev_password
+      POSTGRES_DB: ledger
+      # 開發環境用 UTC，避免時區把 TIMESTAMPTZ 的驗證搞混
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      # 對外開 5433，避免撞到本機可能已經在跑的 Postgres（預設 5432）
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Stage 2 的 migration 會放這裡；容器首次初始化時會自動依檔名順序執行
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    command:
+      # 開發期把慢查詢與鎖等待印出來，Stage 6 之後對 debug SELECT FOR UPDATE 很有用
+      - "postgres"
+      - "-c"
+      - "log_lock_waits=on"
+      - "-c"
+      - "deadlock_timeout=1s"
+      - "-c"
+      - "log_min_duration_statement=100"
+
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: ledger_engine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # 容器之間用服務名互連，所以是 postgres:5432 而不是 localhost:5433
+      LEDGER_PG_DSN: "postgresql://ledger:ledger_dev_password@postgres:5432/ledger"
+    volumes:
+      # 原始碼掛進容器，在 Mac 上編輯、在 Linux 裡編譯
+      - .:/workspace
+      # build 目錄放在具名 volume，避免容器內產生的 object 檔汙染 Mac 的檔案系統
+      # （也避免 macOS 與 Linux 的 CMake cache 互相衝突）
+      - buildcache:/workspace/build
+    ports:
+      - "9000:9000"   # Stage 4 之後的 TCP server
+    working_dir: /workspace
+
+volumes:
+  pgdata:
+  buildcache:

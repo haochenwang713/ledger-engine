@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libpqxx-dev libgtest-dev clang-format
+
+      - name: Build GoogleTest
+        run: |
+          cmake -S /usr/src/googletest -B /tmp/gtest -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/gtest -j"$(nproc)"
+          sudo cmake --install /tmp/gtest
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLEDGER_WERROR=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Check formatting
+        run: make fmt-check
+
+  sanitizers:
+    name: ${{ matrix.sanitizer }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [TSAN, ASAN]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libpqxx-dev libgtest-dev
+
+      - name: Build GoogleTest
+        run: |
+          cmake -S /usr/src/googletest -B /tmp/gtest -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/gtest -j"$(nproc)"
+          sudo cmake --install /tmp/gtest
+
+      - name: Configure with ${{ matrix.sanitizer }}
+        run: |
+          cmake -S . -B build-san \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLEDGER_ENABLE_${{ matrix.sanitizer }}=ON
+
+      - name: Build
+        run: cmake --build build-san -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build-san --output-on-failure

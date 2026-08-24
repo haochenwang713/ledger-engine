@@ -1,0 +1,28 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+_deps/
+compile_commands.json
+
+# Sanitizer / profiling output
+*.log
+tsan.*
+asan.*
+perf.data*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Python (bench/)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local secrets — never commit real credentials
+.env
+.env.local
