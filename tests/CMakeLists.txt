@@ -28,10 +28,10 @@ include(GoogleTest)
 
 add_executable(ledger_tests
   test_version.cpp
-  # Stage 2  test_money.cpp
-  # Stage 3  test_ledger_core.cpp
+  test_money.cpp
+  test_ledger_core.cpp
+  test_concurrency.cpp
   # Stage 5  test_codec.cpp
-  # Stage 7  test_concurrency.cpp   <- TSan 主戰場
 )
 
 target_link_libraries(ledger_tests

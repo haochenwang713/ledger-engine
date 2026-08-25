@@ -13,12 +13,20 @@ DerivePointerAlignment: false
 PointerAlignment: Left
 SortIncludes: CaseSensitive
 IncludeBlocks: Regroup
+# 對應的標頭（LedgerCore.cpp -> LedgerCore.h）自動排到最前面，優先權 0。
+IncludeIsMainRegex: '$'
 IncludeCategories:
+  # 本專案的標頭
   - Regex: '^<ledger/'
-    Priority: 3
-  - Regex: '^<.*\.h>'
     Priority: 1
-  - Regex: '^<.*>'
+  # 第三方函式庫
+  - Regex: '^<(gtest|gmock|pqxx)/'
     Priority: 2
-  - Regex: '.*'
+  # C 標準函式庫（有 .h 的）
+  - Regex: '^<[a-z_/]+\.h>'
+    Priority: 3
+  # C++ 標準函式庫
+  - Regex: '^<[a-z_]+>'
     Priority: 4
+  - Regex: '.*'
+    Priority: 5

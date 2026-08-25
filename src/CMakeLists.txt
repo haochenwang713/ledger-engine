@@ -11,8 +11,11 @@
 
 add_library(ledger_core STATIC
   common/Version.cpp
-  # Stage 2  money/Currency.cpp  money/Money.cpp
-  # Stage 3  core/Account.cpp  core/AccountRegistry.cpp  core/LedgerCore.cpp
+  money/Currency.cpp
+  money/Money.cpp
+  core/AccountRegistry.cpp
+  core/Journal.cpp
+  core/LedgerCore.cpp
   # Stage 4  net/EventLoop.cpp  net/Acceptor.cpp  net/Connection.cpp  net/Buffer.cpp
   # Stage 5  proto/Codec.cpp  concurrent/ThreadPool.cpp
   # Stage 6  db/PgPool.cpp  db/LedgerRepository.cpp

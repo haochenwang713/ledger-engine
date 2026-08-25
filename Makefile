@@ -6,12 +6,45 @@
 BUILD_DIR ?= build
 JOBS      ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-PSQL ?= docker compose exec -T postgres psql -U ledger -d ledger
+# ---------------------------------------------------------------------------
+# 資料庫連線方式：自動偵測。
+#
+#   有 docker compose  → 用容器裡的 postgres（對外 5433）
+#   沒有               → 用本機安裝的 postgres（預設 5432）
+#
+# 為什麼要有 fallback：Docker Desktop 在 Mac 上是個不小的安裝，而 Stage 2/3
+# 其實只需要一個 Postgres。用 brew 裝的原生 Postgres 一樣能跑完所有檢查，
+# 等 Stage 4 真的要用 epoll 時再處理容器就好。
+#
+# 要強制指定的話：
+#   make db-all LEDGER_DB=docker
+#   make db-all LEDGER_DB=native
+# ---------------------------------------------------------------------------
+LEDGER_DB ?= auto
+PGPORT    ?= 5432
+
+ifeq ($(LEDGER_DB),auto)
+  LEDGER_DB := $(shell docker compose version >/dev/null 2>&1 && echo docker || echo native)
+endif
+
+ifeq ($(LEDGER_DB),docker)
+  PSQL ?= docker compose exec -T postgres psql -U ledger -d ledger
+  PSQL_INTERACTIVE ?= docker compose exec postgres psql -U ledger -d ledger
+else
+  PSQL ?= psql -h localhost -p $(PGPORT) -U ledger -d ledger
+  PSQL_INTERACTIVE ?= $(PSQL)
+  # 若 pg_hba 設成要密碼就會用到；Homebrew 預設是 trust，這行不會有影響。
+  export PGPASSWORD ?= ledger_dev_password
+endif
 
 .PHONY: help up down shell configure build test run clean rebuild tsan asan \
-        fmt fmt-check psql db-reset db-seed db-check db-test db-status db-all
+        fmt fmt-check psql db-reset db-seed db-check db-test db-status db-all \
+        db-native-setup doctor
 
 help:
+	@echo "先跑這個"
+	@echo "  make doctor      檢查環境，告訴你缺什麼、下一步該做什麼"
+	@echo ""
 	@echo "Docker 環境"
 	@echo "  make up          啟動 postgres + engine 容器"
 	@echo "  make down        關閉容器（保留資料）"
@@ -41,6 +74,34 @@ help:
 	@echo "  make fmt         用 clang-format 就地格式化"
 	@echo "  make fmt-check   檢查格式但不修改（CI 用）"
 
+# --- Doctor ----------------------------------------------------------------
+# 環境健檢。卡住的時候先跑這個，它會告訴你缺什麼。
+
+doctor:
+	@echo "═══ 環境檢查 ═══"
+	@printf '%-22s' "作業系統"; uname -s
+	@printf '%-22s' "C++ 編譯器"; (c++ --version 2>/dev/null | head -1) || echo "✗ 找不到"
+	@printf '%-22s' "CMake"; (cmake --version 2>/dev/null | head -1) || echo "✗ 找不到"
+	@printf '%-22s' "git"; (git --version 2>/dev/null) || echo "✗ 找不到"
+	@printf '%-22s' "docker"; (docker --version 2>/dev/null) || echo "— 未安裝（Stage 4 之前不需要）"
+	@printf '%-22s' "docker compose"; (docker compose version 2>/dev/null | head -1) \
+	   || echo "— 不可用（要先開 Docker Desktop）"
+	@printf '%-22s' "psql"; (psql --version 2>/dev/null) || echo "— 未安裝"
+	@echo ""
+	@echo "資料庫模式：$(LEDGER_DB)"
+	@if [ "$(LEDGER_DB)" = "native" ]; then \
+	  printf '%-22s' "本機 Postgres"; \
+	  (pg_isready -h localhost -p $(PGPORT) 2>/dev/null) || echo "✗ 沒有回應（port $(PGPORT)）"; \
+	else \
+	  printf '%-22s' "容器 Postgres"; \
+	  (docker compose ps postgres 2>/dev/null | tail -1) || echo "✗ 未啟動"; \
+	fi
+	@echo ""
+	@echo "═══ 各 Stage 需要什麼 ═══"
+	@echo "  Stage 1-3   只需要 C++ 編譯器 + CMake        →  make test"
+	@echo "  Stage 2     再加一個 Postgres（原生或容器）  →  make db-all"
+	@echo "  Stage 4+    需要 Linux（epoll）              →  make up && make shell"
+
 # --- Docker ----------------------------------------------------------------
 
 up:
@@ -57,7 +118,28 @@ shell:
 # docker compose exec 進到 postgres 容器。先跑過 make up。
 
 psql:
-	docker compose exec postgres psql -U ledger -d ledger
+	$(PSQL_INTERACTIVE)
+
+# 在本機（非容器）的 Postgres 上建立 ledger 角色與資料庫。只需要跑一次。
+#
+# 前提：brew install postgresql@16 && brew services start postgresql@16
+#
+# PGSUPERUSER 預設是目前登入的使用者 —— Homebrew 安裝的 Postgres 會把
+# 安裝者設成 superuser，所以在 Mac 上通常不用改。
+# 若你的環境不是這樣：make db-native-setup PGSUPERUSER=postgres
+PGSUPERUSER ?= $(shell whoami)
+
+db-native-setup:
+	@echo "在本機 Postgres（port $(PGPORT)，以 $(PGSUPERUSER) 連線）建立 ledger 角色與資料庫"
+	@psql -h localhost -p $(PGPORT) -U $(PGSUPERUSER) -d postgres -tAc \
+	   "SELECT 1 FROM pg_roles WHERE rolname='ledger'" | grep -q 1 \
+	   || psql -h localhost -p $(PGPORT) -U $(PGSUPERUSER) -d postgres -q -c \
+	      "CREATE ROLE ledger LOGIN PASSWORD 'ledger_dev_password'"
+	@psql -h localhost -p $(PGPORT) -U $(PGSUPERUSER) -d postgres -tAc \
+	   "SELECT 1 FROM pg_database WHERE datname='ledger'" | grep -q 1 \
+	   || psql -h localhost -p $(PGPORT) -U $(PGSUPERUSER) -d postgres -q -c \
+	      "CREATE DATABASE ledger OWNER ledger"
+	@echo "✓ 完成。接著跑 make db-all"
 
 db-status:
 	@echo "── 已套用的 migration ──"

@@ -5,8 +5,8 @@ multi-currency account transfers over a hand-rolled epoll event loop, prevents
 double-spending under concurrent load, and guarantees that every transfer is
 recorded as a balanced pair of immutable journal entries.
 
-> **Status:** Stage 2 of 9 — schema is live and enforces double-entry at the
-> database level. See [Roadmap](#roadmap) for what is done and what is next.
+> **Status:** Stage 3 of 9 — the in-memory ledger core is complete and verified
+> clean under ThreadSanitizer. See [Roadmap](#roadmap) for what is next.
 
 ---
 
@@ -68,12 +68,22 @@ account rather than a single mixed-currency entry pair.
 
 ## Requirements
 
-**`epoll` is Linux-only.** There is no `<sys/epoll.h>` on macOS or Windows, and
-the build fails at compile time on those platforms by design. Use the provided
-Docker environment.
+Requirements grow with the stages, so you do not need everything on day one:
 
-- Docker + Docker Compose (the only hard requirement)
-- Or, natively on Linux: GCC 11+ / Clang 14+, CMake 3.22+, libpqxx, GoogleTest
+| What you want to run | What you need |
+|---|---|
+| Ledger core and its tests (stages 1–3) | A C++20 compiler and CMake 3.22+. Any platform — macOS included |
+| Schema checks (stage 2) | Also a PostgreSQL 16, native or containerized |
+| The TCP server (stages 4+) | Linux, because `epoll` has no macOS equivalent |
+
+`epoll` is Linux-only, but that constraint belongs to the networking layer
+alone. The ledger core — accounts, ordered lock acquisition, `shared_mutex` —
+is plain standard C++20 and builds and runs natively on macOS, sanitizers
+included. Only the socket layer needs a container.
+
+```bash
+make doctor      # reports what is installed and what each stage needs
+```
 
 ## Quick start
 
@@ -81,21 +91,29 @@ Docker environment.
 git clone https://github.com/<your-username>/ledger-engine.git
 cd ledger-engine
 
-# Bring up PostgreSQL 16 and the Ubuntu 22.04 build container
+make test        # configure, build, run the test suite — no Docker needed
+```
+
+Expected output:
+
+```
+100% tests passed, 0 tests failed out of 37
+```
+
+For the schema checks, pick whichever PostgreSQL is easier for you. The
+Makefile detects Docker and falls back to a native install, so the commands are
+the same either way.
+
+```bash
+# Option A — Docker (also gives you the Linux container for stages 4+)
 make up
 
-# Drop into the build container
-make shell
+# Option B — native PostgreSQL, no Docker
+brew install postgresql@16 && brew services start postgresql@16
+make db-native-setup
 
-# Inside the container:
-make test    # configure, build, and run the test suite
-make run     # run the engine binary
-```
-
-Expected output from `make test`:
-
-```
-100% tests passed, 0 tests failed out of 3
+# Either way:
+make db-all
 ```
 
 `make help` lists every available target.
@@ -135,6 +153,66 @@ error shapes they know about; a lost update writes rows that are individually
 valid and only wrong in relation to each other, which is why **I2** compares
 each balance snapshot against the sum of its entries.
 
+## How the locking works
+
+A transfer touches two accounts, so it takes two locks. Which order it takes
+them in is the whole design.
+
+```cpp
+if (req.from == req.to) return ErrorCode::SelfTransfer;  // before any lock
+
+Account* lo = from;
+Account* hi = to;
+if (lo->id() > hi->id()) std::swap(lo, hi);   // always ascending account id
+
+std::unique_lock loGuard(lo->mutex);
+std::unique_lock hiGuard(hi->mutex);
+// check balance and apply it, both inside this one critical section
+```
+
+Locking in the request's own direction deadlocks: a thread moving 1001 → 2002
+holds 1001 and waits for 2002 while a thread moving 2002 → 1001 holds 2002 and
+waits for 1001. Sorting by account id means both threads take 1001 first, so
+the second one blocks while **holding nothing** — it cannot become anyone's
+blocker, and the wait-for graph stays acyclic. That is a proof, not a heuristic:
+along any cycle the ids would have to increase strictly and still return to the
+start.
+
+The self-transfer guard has to come first. Without it `lo` and `hi` are the same
+account, the same non-recursive mutex gets locked twice, and the thread wedges
+itself — undefined behavior that presents as a random hang.
+
+One inversion is deliberate. `auditMutex_` is taken **shared by transfers**
+(which write) and **exclusive by audits** (which read). It does not protect a
+variable; it protects the property "no transfer is in flight". Transfers already
+exclude each other through the account locks, so they pay nothing, while an
+audit gets a genuinely consistent cross-account snapshot instead of account A's
+new balance beside account B's old one.
+
+## What the concurrency tests actually prove
+
+Concurrency bugs are the ones that usually don't happen. So the tests generate
+real contention and then check properties that hold no matter how the threads
+interleave.
+
+| Test | What it would catch |
+|---|---|
+| `TotalMoneyIsConserved` | 32 threads, 96k transfers over 20 accounts. Total per currency must be **exactly** unchanged. A lost update shows up as money appearing or vanishing |
+| `ConcurrentWithdrawalsCannotOverdraw` | One account holds 1000, everyone withdraws 100. Exactly 10 succeed — 11 would mean money created from nothing |
+| `OppositeDirectionTransfersDoNotDeadlock` | 32 threads, two accounts, 640k opposing transfers. Deadlock presents as a hang, caught by the ctest timeout |
+| `AuditSeesConsistentSnapshotDuringTraffic` | Every audit taken mid-traffic must see the correct total |
+| `RegistryGrowthDoesNotInvalidatePointers` | 20k accounts created while transfers run. Rehashing must not invalidate a live `Account*` |
+
+These were checked against deliberately broken builds, because a test that
+cannot fail proves nothing:
+
+- Removing the `std::swap` deadlocks within 30 seconds.
+- Downgrading the account locks to `shared_lock` loses 8081 units out of
+  20,000,000 and trips both the conservation check and the I2 recompute.
+
+Both sanitizer builds are clean: no data races under ThreadSanitizer, no
+use-after-free or undefined behavior under AddressSanitizer/UBSan.
+
 ## Development
 
 ```bash
@@ -164,8 +242,8 @@ anywhere else.
 | 0 | Architecture design, module split, thread model | ✅ Done |
 | 1 | Project skeleton, CMake, Docker Compose | ✅ Done |
 | 2 | DB schema: `currencies` / `accounts` / `transactions` / `entries` | ✅ Done |
-| 3 | Ledger core — in-memory, `shared_mutex`, no DB yet | ⬜ Next |
-| 4 | epoll TCP server (echo first) | ⬜ |
+| 3 | Ledger core — in-memory, `shared_mutex`, no DB yet | ✅ Done |
+| 4 | epoll TCP server (echo first) | ⬜ Next |
 | 5 | Wire protocol framing + thread pool | ⬜ |
 | 6 | PostgreSQL integration with `SELECT … FOR UPDATE` | ⬜ |
 | 7 | ThreadSanitizer / AddressSanitizer verification | ⬜ |
