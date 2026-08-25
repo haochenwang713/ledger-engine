@@ -5,8 +5,8 @@ multi-currency account transfers over a hand-rolled epoll event loop, prevents
 double-spending under concurrent load, and guarantees that every transfer is
 recorded as a balanced pair of immutable journal entries.
 
-> **Status:** Stage 3 of 9 — the in-memory ledger core is complete and verified
-> clean under ThreadSanitizer. See [Roadmap](#roadmap) for what is next.
+> **Status:** Stage 4 of 9 — the epoll event loop is running an echo server,
+> clean under both sanitizers. See [Roadmap](#roadmap) for what is next.
 
 ---
 
@@ -97,7 +97,7 @@ make test        # configure, build, run the test suite — no Docker needed
 Expected output:
 
 ```
-100% tests passed, 0 tests failed out of 37
+100% tests passed, 0 tests failed out of 56
 ```
 
 For the schema checks, pick whichever PostgreSQL is easier for you. The
@@ -213,6 +213,63 @@ cannot fail proves nothing:
 Both sanitizer builds are clean: no data races under ThreadSanitizer, no
 use-after-free or undefined behavior under AddressSanitizer/UBSan.
 
+## The two rules that make edge-triggered epoll work
+
+`epoll` in edge-triggered mode reports a fd only when its state *changes*.
+That makes it cheaper than level-triggered, and it makes two mistakes fatal in
+a way that small tests never reveal.
+
+**Drain every readable fd until `EAGAIN`.** If you stop early, the remaining
+bytes sit in the kernel buffer, the state never changes again, and epoll never
+notifies you. That connection goes permanently silent: the client waits for a
+response, the server believes no request arrived. The same rule applies to
+`accept()` — stop early and a connection sits in the backlog forever, its
+handshake already complete.
+
+**Handle short writes.** When the kernel send buffer fills, `write()` returns
+`EAGAIN`. The rest of the response has to stay buffered while you register
+`EPOLLOUT` and wait to be told the socket is writable again — and you must
+deregister it once drained, or a permanently-writable socket spins the loop at
+100% CPU.
+
+Both bugs are invisible below the read-chunk size and under fast clients. The
+tests therefore push 1 MB through a single read event and make a client stop
+reading mid-response.
+
+Writes are funnelled through the loop thread for a separate reason: two threads
+calling `write()` on one socket interleave their bytes, the length prefix stops
+lining up, and the protocol desynchronises. That is not a data race — `write()`
+is thread-safe — so ThreadSanitizer will never flag it. `Connection::send()` is
+callable from any thread and hands the actual write to the loop via an
+`eventfd` wakeup.
+
+## What Stage 4's tests prove
+
+| Test | What it would catch |
+|---|---|
+| `EdgeTriggeredReadDrainsTheEntireSocket` | 1 MB through one read event. A missing drain loop delivers ~131 KB and then hangs |
+| `HandlesPartialWritesWhenClientStopsReading` | Client stops reading mid-response. Without `EPOLLOUT` the tail is silently dropped |
+| `ServesManyConcurrentClients` | 50 clients × 20 round-trips on one loop thread |
+| `SurvivesAbruptDisconnects` | 200 connect-then-immediately-close cycles. Catches fd leaks |
+| `ReadsDataSentImmediatelyBeforeClose` | Data sent just before `FIN` must not be dropped — read has to be handled before hangup |
+| `RunInLoopHandlesManyCrossThreadTasks` | 2000 tasks from 8 threads, none lost |
+
+Checked against broken builds, as in earlier stages:
+
+- Reading once instead of draining: 131,018 of 1,048,576 bytes arrive, then the
+  connection stalls until the test times out.
+- Skipping the `EPOLLOUT` registration: 3,994,597 of 4,194,304 bytes arrive.
+
+The second one is worth a note. The first version of that test passed *even
+with the bug present*, because the client was still streaming data and every
+read event happened to re-drive the write path. The test was being rescued by
+traffic it did not control. Adding a 300 ms pause after the client stops sending
+is what made it actually test the thing it claimed to test.
+
+ThreadSanitizer also caught three real races in this stage that reading the code
+had not: `EventLoop::threadId_`, `Acceptor::accepted_`, and reading
+`connections_.size()` from outside the loop thread. All three are now atomic.
+
 ## Development
 
 ```bash
@@ -243,8 +300,8 @@ anywhere else.
 | 1 | Project skeleton, CMake, Docker Compose | ✅ Done |
 | 2 | DB schema: `currencies` / `accounts` / `transactions` / `entries` | ✅ Done |
 | 3 | Ledger core — in-memory, `shared_mutex`, no DB yet | ✅ Done |
-| 4 | epoll TCP server (echo first) | ⬜ Next |
-| 5 | Wire protocol framing + thread pool | ⬜ |
+| 4 | epoll TCP server (echo first) | ✅ Done |
+| 5 | Wire protocol framing + thread pool | ⬜ Next |
 | 6 | PostgreSQL integration with `SELECT … FOR UPDATE` | ⬜ |
 | 7 | ThreadSanitizer / AddressSanitizer verification | ⬜ |
 | 8 | Locust load tests, tuning, TPS and p95 numbers | ⬜ |

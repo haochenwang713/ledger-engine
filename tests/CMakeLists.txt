@@ -31,8 +31,14 @@ add_executable(ledger_tests
   test_money.cpp
   test_ledger_core.cpp
   test_concurrency.cpp
+  test_buffer.cpp        # 平台無關
   # Stage 5  test_codec.cpp
 )
+
+# 網路整合測試只在 Linux 上編譯 —— 它們需要真的 epoll。
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_sources(ledger_tests PRIVATE test_echo_server.cpp)
+endif()
 
 target_link_libraries(ledger_tests
   PRIVATE ledger_core

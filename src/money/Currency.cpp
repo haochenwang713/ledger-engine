@@ -109,6 +109,16 @@ std::string_view toString(ErrorCode code) noexcept {
       return "AMOUNT_OVERFLOW";
     case ErrorCode::DuplicateAccount:
       return "DUPLICATE_ACCOUNT";
+    case ErrorCode::SocketError:
+      return "SOCKET_ERROR";
+    case ErrorCode::BindFailed:
+      return "BIND_FAILED";
+    case ErrorCode::ListenFailed:
+      return "LISTEN_FAILED";
+    case ErrorCode::EpollError:
+      return "EPOLL_ERROR";
+    case ErrorCode::ConnectionClosed:
+      return "CONNECTION_CLOSED";
   }
   return "UNKNOWN_ERROR";
 }

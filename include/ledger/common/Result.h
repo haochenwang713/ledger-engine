@@ -28,6 +28,13 @@ enum class ErrorCode : std::uint16_t {
 
   // --- 其他 ---
   DuplicateAccount,  ///< 同一 owner 同一幣別已有帳戶
+
+  // --- 網路層（Stage 4）---
+  SocketError,       ///< socket 系統呼叫失敗，詳情看 errno
+  BindFailed,        ///< bind() 失敗，通常是 port 已被占用
+  ListenFailed,      ///< listen() 失敗
+  EpollError,        ///< epoll_create / epoll_ctl / epoll_wait 失敗
+  ConnectionClosed,  ///< 對端關閉了連線
 };
 
 [[nodiscard]] std::string_view toString(ErrorCode code) noexcept;
