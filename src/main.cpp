@@ -16,11 +16,18 @@
 
 namespace {
 
-// epoll 是 Linux 專屬的 API。macOS 用的是 kqueue，Windows 用 IOCP。
-// 這個專案規格指定 epoll，所以只能在 Linux 上建置與執行。
-// 在編譯期就擋下來，比等到 Stage 4 才發現 <sys/epoll.h> 找不到要好得多。
-#if !defined(__linux__)
-#error "ledger_engine 需要 Linux（epoll 是 Linux 專屬 API）。請用 docker compose 在容器內建置：make dev"
+// epoll 是 Linux 專屬 API（macOS 用 kqueue，Windows 用 IOCP）。
+//
+// 但「需要 Linux」只適用於網路層（Stage 4 之後）。核心帳本邏輯
+// —— Account、AccountRegistry、shared_mutex 排序取鎖 —— 是純標準 C++20，
+// 在 macOS 上編譯與執行都沒問題，TSan/ASan 也能跑。
+//
+// 所以這裡用「編譯期常數 + 執行期檢查」，而不是 #error 把整個建置擋掉。
+// 這樣在 Mac 上可以原生開發 Stage 3，只有真的要開 socket 時才需要進容器。
+#if defined(__linux__)
+inline constexpr bool kHasEpoll = true;
+#else
+inline constexpr bool kHasEpoll = false;
 #endif
 
 void printUsage() {
@@ -54,6 +61,15 @@ int main(int argc, char* argv[]) {
   }
 
   std::cout << ledger::buildInfo() << '\n';
+
+  if constexpr (kHasEpoll) {
+    std::cout << "平台：Linux，epoll 可用。\n";
+  } else {
+    std::cout << "平台：非 Linux，沒有 epoll —— 網路層（Stage 4 之後）需要在\n"
+              << "      Linux 容器內執行：make up && make shell\n"
+              << "      核心帳本邏輯與測試在本平台可以原生建置與執行。\n";
+  }
+
   std::cout << "Stage 1 空殼啟動成功。TCP server 尚未實作（Stage 4）。\n";
   return EXIT_SUCCESS;
 }
