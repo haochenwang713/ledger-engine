@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdint>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -35,9 +36,34 @@ enum class ErrorCode : std::uint16_t {
   ListenFailed,      ///< listen() 失敗
   EpollError,        ///< epoll_create / epoll_ctl / epoll_wait 失敗
   ConnectionClosed,  ///< 對端關閉了連線
+
+  // --- 協定層（Stage 5）---
+  //
+  // ⚠ 新增錯誤碼一律往這個 enum 的「最後面」加。
+  //   數值會被 BinaryCodec 直接序列化成 u16 送給 client，
+  //   在中間插入一個新值會讓所有既有 client 的錯誤碼整組錯位。
+  MalformedFrame,  ///< 位元組不成一則合法訊息（長度不符、欄位讀不完、JSON 語法錯）
+  UnknownMessageType,  ///< 型別代碼不認識，或方向不對（請求裡出現回應型別）
+  UnsupportedVersion,  ///< 協定版本不是 kProtocolVersion
+  FrameTooLarge,       ///< 單則訊息超過 kMaxFrameSize
+  IntegerNotString,    ///< JSON 的整數欄位不是字串（見 JsonCodec 的 2^53 說明）
+  MissingField,        ///< JSON 物件少了必要的 key
+  ServerBusy,          ///< 佇列已滿，背壓生效（Stage 5b 起使用）
+
+  /// 錯誤碼總數。必須永遠是最後一個。
+  ///
+  /// 它讓 errorCodeFromString() 可以走訪全部的值去做反查，
+  /// 而不需要維護第二張名字對照表 —— 少一張表就少一個會漂移的地方。
+  Count,
 };
 
 [[nodiscard]] std::string_view toString(ErrorCode code) noexcept;
+
+/// toString() 的反向操作。認不得的名字回 ErrorCode::Count。
+///
+/// 只有 client 端解碼錯誤回應時才需要（JSON 的 code 欄位是名字而非數字）。
+/// 實作方式是走訪 0..Count 比對 toString()，所以名字表實體上只有一份。
+[[nodiscard]] ErrorCode errorCodeFromString(std::string_view name) noexcept;
 
 // ---------------------------------------------------------------------------
 // Result<T> —— 「成功帶值，失敗帶錯誤碼」的最小實作。
@@ -51,6 +77,20 @@ enum class ErrorCode : std::uint16_t {
 // ---------------------------------------------------------------------------
 template <typename T>
 class Result {
+  // ⚠ T 不能是 ErrorCode 本身。
+  //
+  //   Result<T> 靠兩個隱式建構子區分成功與失敗：Result(T) 和 Result(ErrorCode)。
+  //   當 T == ErrorCode 時這兩個簽章完全相同 —— 多載衝突，而且就算能編譯，
+  //   Result<ErrorCode>{SomeError} 到底代表「成功地得到一個錯誤碼」還是
+  //   「失敗了」也沒有答案。這個型別在語意上就是矛盾的。
+  //
+  //   直接 static_assert 擋掉，是為了讓誤用時看到這一行，而不是六十行的
+  //   template 展開訊息。要傳遞一個可能失敗的 ErrorCode，請用
+  //   「bool + 輸出參數」的形式（見 JsonCodec 的 fromJsonValue）。
+  static_assert(!std::is_same_v<T, ErrorCode>,
+                "Result<ErrorCode> 在語意上是矛盾的：成功值與錯誤值同型別，"
+                "無法區分。請改用 bool + 輸出參數。");
+
  public:
   /// 成功
   Result(T value) : storage_(std::move(value)) {}  // NOLINT(google-explicit-constructor)

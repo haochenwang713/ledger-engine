@@ -32,7 +32,7 @@ add_executable(ledger_tests
   test_ledger_core.cpp
   test_concurrency.cpp
   test_buffer.cpp        # 平台無關
-  # Stage 5  test_codec.cpp
+  test_codec.cpp         # Stage 5a：協定層，平台無關
 )
 
 # 網路整合測試只在 Linux 上編譯 —— 它們需要真的 epoll。

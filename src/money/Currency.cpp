@@ -119,8 +119,40 @@ std::string_view toString(ErrorCode code) noexcept {
       return "EPOLL_ERROR";
     case ErrorCode::ConnectionClosed:
       return "CONNECTION_CLOSED";
+    case ErrorCode::MalformedFrame:
+      return "MALFORMED_FRAME";
+    case ErrorCode::UnknownMessageType:
+      return "UNKNOWN_MESSAGE_TYPE";
+    case ErrorCode::UnsupportedVersion:
+      return "UNSUPPORTED_VERSION";
+    case ErrorCode::FrameTooLarge:
+      return "FRAME_TOO_LARGE";
+    case ErrorCode::IntegerNotString:
+      return "INTEGER_NOT_STRING";
+    case ErrorCode::MissingField:
+      return "MISSING_FIELD";
+    case ErrorCode::ServerBusy:
+      return "SERVER_BUSY";
+    case ErrorCode::Count:
+      break;
   }
   return "UNKNOWN_ERROR";
+}
+
+ErrorCode errorCodeFromString(std::string_view name) noexcept {
+  // 走訪全部合法值比對名字。這樣「名字」只在上面的 switch 出現一次，
+  // 不會有「encode 用新名字、decode 只認得舊名字」的漂移。
+  //
+  // 成本是 O(n) 的字串比較，但這條路徑只在 client 解碼錯誤回應時走到 ——
+  // 而錯誤回應本來就是罕見路徑。用不對稱的成本換掉一整類漂移，很划算。
+  const auto count = static_cast<std::uint16_t>(ErrorCode::Count);
+  for (std::uint16_t i = 0; i < count; ++i) {
+    const auto candidate = static_cast<ErrorCode>(i);
+    if (toString(candidate) == name) {
+      return candidate;
+    }
+  }
+  return ErrorCode::Count;
 }
 
 }  // namespace ledger

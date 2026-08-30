@@ -71,6 +71,35 @@ if(LEDGER_ENABLE_ASAN)
 endif()
 
 # ---------------------------------------------------------------------------
+# nlohmann/json —— JSON port 的解析器（Stage 5）
+#
+# 取得策略跟 GoogleTest 一致：先找系統套件，找不到才從網路抓。
+# Dockerfile.dev 已經 apt install nlohmann-json3-dev，所以容器內建置
+# 是零網路、秒配置。
+#
+# 為什麼引入第三方庫：手刻 binary 序列化是這個專案的展示點，值得自己寫；
+# 手刻 JSON parser 不是 —— 它只會拖慢進度並製造 bug，而且沒有人會因為
+# 「他自己寫了 JSON parser」而加分。分界線是「這段程式碼有沒有在
+# 展示這個專案想展示的能力」。
+# ---------------------------------------------------------------------------
+find_package(nlohmann_json 3.10 QUIET)
+
+if(nlohmann_json_FOUND)
+  message(STATUS "nlohmann/json: 使用系統安裝版本")
+else()
+  message(STATUS "nlohmann/json: 系統找不到，改用 FetchContent 下載")
+  include(FetchContent)
+  FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    TRUE
+  )
+  set(JSON_BuildTests OFF CACHE INTERNAL "")
+  FetchContent_MakeAvailable(nlohmann_json)
+endif()
+
+# ---------------------------------------------------------------------------
 # Subdirectories
 # ---------------------------------------------------------------------------
 add_subdirectory(src)

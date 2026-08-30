@@ -17,8 +17,12 @@ add_library(ledger_core STATIC
   core/Journal.cpp
   core/LedgerCore.cpp
   net/Buffer.cpp          # 平台無關，macOS 上也能編譯與測試
-  # Stage 5  proto/Codec.cpp  concurrent/ThreadPool.cpp
-  # Stage 6  db/PgPool.cpp  db/LedgerRepository.cpp
+  proto/Messages.cpp      # Stage 5a：協定層完全不碰 socket，macOS 也能測
+  proto/FrameSplitter.cpp
+  proto/BinaryCodec.cpp
+  proto/JsonCodec.cpp
+  # Stage 5b  concurrent/ThreadPool.cpp
+  # Stage 6   db/PgPool.cpp  db/LedgerRepository.cpp
 )
 
 # PUBLIC：連結 ledger_core 的 target 也會拿到這個 include 路徑
@@ -64,6 +68,7 @@ target_link_libraries(ledger_core
   PRIVATE ledger_warnings      # 警告只套用在編譯 ledger_core 自己的原始檔
   PUBLIC  ledger_sanitizers    # sanitizer 必須全程式一致，所以是 PUBLIC
   PUBLIC  Threads::Threads
+  PUBLIC  nlohmann_json::nlohmann_json   # header-only，PUBLIC 讓測試也拿得到
 )
 
 # ---------------------------------------------------------------------------
