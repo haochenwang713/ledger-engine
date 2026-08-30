@@ -5,8 +5,9 @@ multi-currency account transfers over a hand-rolled epoll event loop, prevents
 double-spending under concurrent load, and guarantees that every transfer is
 recorded as a balanced pair of immutable journal entries.
 
-> **Status:** Stage 4 of 9 — the epoll event loop is running an echo server,
-> clean under both sanitizers. See [Roadmap](#roadmap) for what is next.
+> **Status:** Stage 5 of 9 — the wire protocol and the worker pool are done and
+> clean under both sanitizers; wiring them into the event loop is next. See
+> [Roadmap](#roadmap) for the rest.
 
 ---
 
@@ -270,6 +271,96 @@ ThreadSanitizer also caught three real races in this stage that reading the code
 had not: `EventLoop::threadId_`, `Acceptor::accepted_`, and reading
 `connections_.size()` from outside the loop thread. All three are now atomic.
 
+## One field declaration, two encodings
+
+The server speaks two protocols: a length-prefixed binary frame on port 9000,
+and newline-delimited JSON on port 9001 so that `nc` is a usable debugging
+client. Supporting both by hand would mean writing every message field four
+times — binary encode, binary decode, JSON encode, JSON decode. Adding a field
+and forgetting one of the four is a silent failure: it compiles, that
+encoding's tests pass, and only the *other* encoding is quietly missing a field.
+
+Instead each message declares its fields exactly once:
+
+```cpp
+static constexpr auto fields() {
+  return std::tuple{
+      Field{"idem_key", &TransferReq::idemKey},
+      Field{"from",     &TransferReq::from},
+      Field{"amount",   &TransferReq::amount},
+      Field{"ccy",      &TransferReq::ccy},
+  };
+}
+```
+
+Both codecs walk that tuple and dispatch on the field type, so each one only
+implements five primitives rather than one function per message. A field type
+with no dispatch arm is a `static_assert`, not a silently skipped field.
+
+**Every integer crosses the JSON boundary as a string.** JavaScript numbers are
+IEEE-754 doubles, so `JSON.parse('{"amount":9007199254740993}')` returns
+9007199254740992 — no error, no warning, one cent gone. Bare numbers in integer
+fields are rejected outright rather than accepted while the values happen to be
+small. Protobuf's canonical JSON mapping made the same call for the same reason.
+
+The trade-off is that reordering `fields()` silently changes the binary layout
+while leaving JSON untouched, and round-trip tests cannot see it — encoder and
+decoder change together and stay consistent with each other. That is what the
+byte-level golden table in `test_codec.cpp` is for; it doubles as the protocol
+specification.
+
+## Backpressure, and two different ways to stop
+
+Work reaches the workers through a bounded queue. Bounded is the point: an
+unbounded queue responds to a slow database by growing without limit and by
+queueing requests whose clients timed out long ago. Both are worse than saying
+no. The IO thread therefore only ever calls `tryPush`, and turns a refusal into
+a `SERVER_BUSY` response — an event loop that blocks stalls *every* connection,
+not just the one that was unlucky.
+
+Shutdown needs two distinct meanings, so it gets two mechanisms:
+
+| | Effect |
+|---|---|
+| `close()` | Refuse new work, but finish what is already queued — those clients are still waiting for an answer |
+| `stop_token` | Abandon the queue immediately |
+
+Workers are `std::jthread` blocked in
+`condition_variable_any::wait(lock, stop_token, pred)`, so `request_stop()`
+wakes them with nobody having to remember to notify, and the destructor cannot
+leave a thread behind.
+
+Handlers are an abstract interface owned by `unique_ptr`, not `std::function`.
+Stage 6 handlers will hold a `pqxx::connection`, which is move-only, and
+`std::function` requires its target to be copyable. The factory runs *on* the
+worker thread, so each database connection is created, used, and destroyed on
+one thread and needs no lock at all.
+
+## What Stage 5's tests prove
+
+| Test | What it would catch |
+|---|---|
+| `CodecGolden.*` | Byte-level layout of every message. Reordering `fields()` breaks binary compatibility silently; round-trip tests cannot see it |
+| `CodecInt64.ValuesBeyondDoublePrecisionSurvive` | 2⁵³+1 through both codecs |
+| `CodecInt64.JsonRejectsBareNumbers` | An unquoted integer is an error, not a lucky small value |
+| `FrameSplitter*.OversizedLengthIsRejectedImmediately` | A client sending `len = 0xFFFFFFFF` and then going quiet must not make us wait forever |
+| `BlockingQueue.TryPushNeverBlocksWhenFull` | 10,000 rejected pushes must take microseconds, not block |
+| `BlockingQueue.CloseWakesEveryBlockedConsumer` | `notify_one` instead of `notify_all` leaves threads asleep and `join()` never returns |
+| `ThreadPool.DiscardsResultWhenSinkIsGone` | A client that disconnects while its request is queued |
+| `ThreadPool.EachWorkerGetsItsOwnHandler` | The precondition for one database connection per worker |
+
+Checked against broken builds, as in earlier stages:
+
+- `notify_all` → `notify_one` in `close()`: the process hangs forever with no
+  output at all and is killed by the ctest timeout.
+- `tryPush` → blocking `push` in `submit()`: 200 submissions take **9,780 ms**
+  instead of under 1 ms.
+
+The first one is why `gtest_discover_tests` sets a timeout. A missed
+notification and a lock-order deadlock both manifest as *never returning*, not
+as a failed assertion — the assertion never gets a chance to run, so the
+timeout is the only thing that can judge them.
+
 ## Development
 
 ```bash
@@ -292,6 +383,23 @@ psql postgresql://ledger:ledger_dev_password@localhost:5433/ledger
 Credentials in `docker-compose.yml` are development-only and are not used
 anywhere else.
 
+### Building on both platforms is a test in itself
+
+Everything except `net/` builds and runs natively on macOS. `net/` needs
+`epoll`, `eventfd`, and `accept4`, so it is compiled only on Linux and the
+server has to run in the container. The core, the money types, the protocol
+layer, and the thread pool are all platform-independent on purpose — they are
+the parts that need the fastest edit-compile-test loop.
+
+Keeping that second platform alive costs a little and has already paid for
+itself. `main.cpp` parsed `--port` and then only read it inside the
+`LEDGER_HAS_EPOLL` branch, so on macOS the variable was written and never read.
+AppleClang's `-Wunused-but-set-variable` plus `-Werror` rejected the build. The
+Linux CI could never have seen it: on Linux the variable *is* read.
+
+Two compilers disagreeing is information. A warning that only one of them
+raises is usually pointing at a code path the other one never compiles.
+
 ## Roadmap
 
 | Stage | Deliverable | Status |
@@ -301,7 +409,7 @@ anywhere else.
 | 2 | DB schema: `currencies` / `accounts` / `transactions` / `entries` | ✅ Done |
 | 3 | Ledger core — in-memory, `shared_mutex`, no DB yet | ✅ Done |
 | 4 | epoll TCP server (echo first) | ✅ Done |
-| 5 | Wire protocol framing + thread pool | ⬜ Next |
+| 5 | Wire protocol framing + thread pool | 🔶 5a/5b done, wiring next |
 | 6 | PostgreSQL integration with `SELECT … FOR UPDATE` | ⬜ |
 | 7 | ThreadSanitizer / AddressSanitizer verification | ⬜ |
 | 8 | Locust load tests, tuning, TPS and p95 numbers | ⬜ |
