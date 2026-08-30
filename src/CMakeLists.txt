@@ -21,7 +21,7 @@ add_library(ledger_core STATIC
   proto/FrameSplitter.cpp
   proto/BinaryCodec.cpp
   proto/JsonCodec.cpp
-  # Stage 5b  concurrent/ThreadPool.cpp
+  concurrent/ThreadPool.cpp   # Stage 5b：執行緒池，平台無關
   # Stage 6   db/PgPool.cpp  db/LedgerRepository.cpp
 )
 

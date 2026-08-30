@@ -136,7 +136,19 @@ int main(int argc, char* argv[]) {
   std::cout << ledger::buildInfo() << '\n';
 
   if constexpr (!kHasEpoll) {
+    // ⚠ 這裡印出 port 不只是為了訊息友善，也讓這個變數在非 Linux 平台
+    //   上真的「被使用」。
+    //
+    //   在 macOS 上 LEDGER_HAS_EPOLL 是關的，runServer(port) 不會被編譯，
+    //   於是 port 變成「有寫入、沒讀取」—— AppleClang 的
+    //   -Wunused-but-set-variable 會擋下整個建置（配上 -Werror）。
+    //
+    //   Linux 的 CI 永遠碰不到這個路徑，所以這類問題只有在真的
+    //   跨平台建置時才會冒出來。用 [[maybe_unused]] 也能消警告，
+    //   但那是把症狀藏起來；把它印出來則是讓使用者知道
+    //   「你給的參數我收到了，只是這個平台用不到」。
     std::cout << "平台：非 Linux，沒有 epoll —— 網路層未建置。\n"
+              << "      （--port " << port << " 已解析，但這個平台不會啟動伺服器）\n"
               << "      核心帳本邏輯與其測試在本平台可以原生執行（make test）。\n"
               << "      要跑伺服器請進 Linux 容器：make up && make shell\n";
     return EXIT_SUCCESS;

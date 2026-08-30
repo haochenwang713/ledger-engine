@@ -33,6 +33,7 @@ add_executable(ledger_tests
   test_concurrency.cpp
   test_buffer.cpp        # 平台無關
   test_codec.cpp         # Stage 5a：協定層，平台無關
+  test_thread_pool.cpp   # Stage 5b：佇列與執行緒池，平台無關
 )
 
 # 網路整合測試只在 Linux 上編譯 —— 它們需要真的 epoll。
@@ -50,4 +51,13 @@ target_link_libraries(ledger_tests
 # 那不是我們的錯，不該讓它汙染測試建置的輸出。
 
 # 把每個 TEST() 註冊成獨立的 CTest 測項，這樣 ctest 的輸出能指出是哪一個失敗。
-gtest_discover_tests(ledger_tests)
+#
+# TIMEOUT 是併發測試的裁判，不是保險絲。
+#
+#   死鎖與「漏了 notify_all」這兩類 bug 的表現形式是「永遠不返回」，
+#   而不是「斷言失敗」—— 程式不會報錯，它只是安靜地卡住。斷言永遠
+#   等不到執行的機會，所以唯一能判定失敗的方式就是逾時。
+#
+#   Stage 3 的反向死鎖測試也是靠這個機制判定的。60 秒對正常執行來說
+#   極度寬鬆（全部測項約 10 秒），但對卡住的情況是決定性的。
+gtest_discover_tests(ledger_tests PROPERTIES TIMEOUT 60)
