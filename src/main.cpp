@@ -1,11 +1,10 @@
 // ---------------------------------------------------------------------------
 // ledger_engine —— 進入點。
 //
-// Stage 4（目前）：跑起 epoll echo server。收到什麼就原樣送回去。
-//                  用途是先把網路層本身跑通、測乾淨，再談協定。
-// Stage 5：       這裡會啟動 ThreadPool（20 個 worker），
-//                 並把 echo 的回呼換成「切 frame → 丟進佇列」。
-// Stage 6：       這裡會初始化 PgPool 並從 DB 載入帳戶狀態。
+// Stage 5（目前）：跑起完整的 LedgerServer —— 兩個 port、兩組執行緒池、
+//                  記憶體帳本。帳戶資料由 seedDemoAccounts() 載入。
+// Stage 6：       seedDemoAccounts() 會被 "SELECT id, balance FROM accounts"
+//                 取代，handler 工廠會為每個 worker 開一條 pqxx::connection。
 // ---------------------------------------------------------------------------
 
 #include <ledger/common/Version.h>
@@ -16,8 +15,12 @@
 #include <string_view>
 
 #if defined(LEDGER_HAS_EPOLL)
-#include <ledger/net/EchoServer.h>
+#include <ledger/core/AccountRegistry.h>
+#include <ledger/core/Journal.h>
+#include <ledger/core/LedgerCore.h>
+#include <ledger/core/LedgerRequestHandler.h>
 #include <ledger/net/EventLoop.h>
+#include <ledger/net/LedgerServer.h>
 
 #include <csignal>
 #endif
@@ -39,16 +42,22 @@ inline constexpr bool kHasEpoll = false;
 #endif
 
 constexpr std::uint16_t kDefaultPort = 9000;
+constexpr std::uint16_t kDefaultJsonPort = 9001;
 
 void printUsage() {
-  std::cout << "usage: ledger_engine [--port N] [--version] [--help]\n"
+  std::cout << "usage: ledger_engine [--port N] [--json-port N] [--version] [--help]\n"
             << "\n"
-            << "  --port N    監聽的 TCP port（預設 " << kDefaultPort << "）\n"
-            << "  --version   印出版本與組建資訊後結束\n"
-            << "  --help      印出這段說明\n"
+            << "  --port N       binary 協定的 TCP port（預設 " << kDefaultPort << "）\n"
+            << "  --json-port N  NDJSON 協定的 TCP port（預設 " << kDefaultJsonPort << "）\n"
+            << "  --version      印出版本與組建資訊後結束\n"
+            << "  --help         印出這段說明\n"
             << "\n"
-            << "Stage 4 是 echo server：收到什麼就原樣送回去。\n"
-            << "測試方式：nc localhost " << kDefaultPort << "\n";
+            << "手動測試（JSON port 就是為此存在）：\n"
+            << "  nc localhost " << kDefaultJsonPort << "\n"
+            << R"(  {"id":"1","type":"ping"})"
+            << "\n"
+            << R"(  {"id":"2","type":"get_account","account_id":"1001"})"
+            << "\n";
 }
 
 #if defined(LEDGER_HAS_EPOLL)
@@ -67,16 +76,32 @@ void handleSignal(int) {
   }
 }
 
-int runServer(std::uint16_t port) {
+int runServer(std::uint16_t binaryPort, std::uint16_t jsonPort) {
   ledger::net::EventLoop loop;
   if (!loop.valid()) {
     std::cerr << "建立 event loop 失敗（epoll_create1 或 eventfd 出錯）\n";
     return EXIT_FAILURE;
   }
 
-  ledger::net::EchoServer server(loop, port);
+  // 帳本的三個部件。它們的生命週期必須比 LedgerServer 長 ——
+  // worker 執行緒會一直持有它們的參照，直到 pool 關閉為止。
+  // 宣告在這裡（LedgerServer 之前）就保證了正確的銷毀順序。
+  ledger::AccountRegistry registry;
+  ledger::Journal journal;
+  ledger::LedgerCore core(registry, journal);
+
+  if (const ledger::Status seeded = ledger::seedDemoAccounts(core, registry); !seeded) {
+    std::cerr << "載入示範帳戶失敗: " << ledger::toString(seeded.error()) << '\n';
+    return EXIT_FAILURE;
+  }
+
+  ledger::net::LedgerServer::Options options;
+  options.binaryPort = binaryPort;
+  options.jsonPort = jsonPort;
+
+  ledger::net::LedgerServer server(loop, core, registry, options);
   if (!server.valid()) {
-    std::cerr << "監聽 port " << port << " 失敗: " << ledger::toString(server.error()) << '\n';
+    std::cerr << "監聽失敗: " << ledger::toString(server.error()) << '\n';
     return EXIT_FAILURE;
   }
   if (!server.start()) {
@@ -94,13 +119,45 @@ int runServer(std::uint16_t port) {
   // 由我們的錯誤處理路徑正常關閉那條連線。
   std::signal(SIGPIPE, SIG_IGN);
 
-  std::cout << "echo server 監聽中：port " << server.port() << '\n'
-            << "試試看：  nc localhost " << server.port() << '\n'
-            << "停止：    Ctrl-C\n";
+  std::cout << "ledger 引擎啟動\n"
+            << "  binary  port " << server.binaryPort() << "（長度前綴）\n"
+            << "  json    port " << server.jsonPort() << "（NDJSON，一行一個物件）\n"
+            << "  workers " << options.binaryWorkers << " binary / " << options.jsonWorkers
+            << " json（各自獨立的佇列）\n"
+            << "  帳戶    " << registry.size() << " 個已載入\n"
+            << "\n"
+            << "試試看：\n"
+            << "  nc localhost " << server.jsonPort() << "\n"
+            << R"(  {"id":"1","type":"get_account","account_id":"1001"})"
+            << "\n"
+            << R"(  {"id":"2","type":"transfer","idem_key":"k1","from":"1001","to":"2002",)"
+            << R"("amount":"2500","ccy":"USD"})"
+            << "\n"
+            << "\n"
+            << "停止：Ctrl-C\n";
 
   loop.run();
 
-  std::cout << "\n已停止。累計接受 " << server.totalConnections() << " 條連線。\n";
+  // ⚠ 順序很重要：先讓 event loop 停下來，再關執行緒池。
+  //
+  //   反過來的話，pool 已經關閉但 loop 還在收請求，
+  //   每一筆新進來的都會拿到 SERVER_BUSY —— client 看到的是
+  //   「伺服器還在，但什麼都不做」，比乾脆拒絕連線更難診斷。
+  server.shutdown();
+
+  const auto& binary = server.binaryPool();
+  const auto& json = server.jsonPool();
+  std::cout << "\n已停止。\n"
+            << "  連線     " << server.totalConnections() << " 條（累計）\n"
+            << "  binary   " << binary.completed() << " 筆完成，" << binary.rejected()
+            << " 筆因佇列滿被拒，" << binary.droppedNoSink() << " 筆因斷線丟棄\n"
+            << "  json     " << json.completed() << " 筆完成，" << json.rejected()
+            << " 筆因佇列滿被拒，" << json.droppedNoSink() << " 筆因斷線丟棄\n"
+            << "  轉帳     " << core.transferCount() << " 成功 / " << core.rejectedCount()
+            << " 拒絕\n"
+            << "  不變式   " << (core.verifyInvariants() ? "通過 —— 帳本是平的" : "★ 失敗 ★")
+            << '\n';
+
   g_loop = nullptr;
   return EXIT_SUCCESS;
 }
@@ -111,6 +168,7 @@ int runServer(std::uint16_t port) {
 
 int main(int argc, char* argv[]) {
   std::uint16_t port = kDefaultPort;
+  std::uint16_t jsonPort = kDefaultJsonPort;
 
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg{argv[i]};
@@ -125,6 +183,10 @@ int main(int argc, char* argv[]) {
     }
     if (arg == "--port" && i + 1 < argc) {
       port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
+      continue;
+    }
+    if (arg == "--json-port" && i + 1 < argc) {
+      jsonPort = static_cast<std::uint16_t>(std::atoi(argv[++i]));
       continue;
     }
 
@@ -148,14 +210,15 @@ int main(int argc, char* argv[]) {
     //   但那是把症狀藏起來；把它印出來則是讓使用者知道
     //   「你給的參數我收到了，只是這個平台用不到」。
     std::cout << "平台：非 Linux，沒有 epoll —— 網路層未建置。\n"
-              << "      （--port " << port << " 已解析，但這個平台不會啟動伺服器）\n"
+              << "      （--port " << port << " / --json-port " << jsonPort
+              << " 已解析，但這個平台不會啟動伺服器）\n"
               << "      核心帳本邏輯與其測試在本平台可以原生執行（make test）。\n"
               << "      要跑伺服器請進 Linux 容器：make up && make shell\n";
     return EXIT_SUCCESS;
   }
 
 #if defined(LEDGER_HAS_EPOLL)
-  return runServer(port);
+  return runServer(port, jsonPort);
 #else
   return EXIT_SUCCESS;
 #endif

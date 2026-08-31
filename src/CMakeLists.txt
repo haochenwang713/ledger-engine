@@ -21,6 +21,8 @@ add_library(ledger_core STATIC
   proto/FrameSplitter.cpp
   proto/BinaryCodec.cpp
   proto/JsonCodec.cpp
+  proto/Session.cpp
+  core/LedgerRequestHandler.cpp   # Stage 5c：協定 ↔ 帳本的翻譯層
   concurrent/ThreadPool.cpp   # Stage 5b：執行緒池，平台無關
   # Stage 6   db/PgPool.cpp  db/LedgerRepository.cpp
 )
@@ -45,7 +47,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     net/EventLoop.cpp
     net/Acceptor.cpp
     net/Connection.cpp
-    net/EchoServer.cpp
+    net/EchoServer.cpp      # Stage 4 的驗收目標；保留為網路層的回歸測試
+    net/LedgerServer.cpp    # Stage 5c：協定 + 執行緒池 + 帳本的接線
   )
   target_compile_definitions(ledger_core PUBLIC LEDGER_HAS_EPOLL=1)
   message(STATUS "網路層（epoll）：啟用")

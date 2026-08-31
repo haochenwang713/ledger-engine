@@ -34,11 +34,15 @@ add_executable(ledger_tests
   test_buffer.cpp        # 平台無關
   test_codec.cpp         # Stage 5a：協定層，平台無關
   test_thread_pool.cpp   # Stage 5b：佇列與執行緒池，平台無關
+  test_session.cpp       # Stage 5c：協定狀態機，平台無關
 )
 
 # 網路整合測試只在 Linux 上編譯 —— 它們需要真的 epoll。
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  target_sources(ledger_tests PRIVATE test_echo_server.cpp)
+  target_sources(ledger_tests PRIVATE
+    test_echo_server.cpp     # Stage 4 的網路層回歸測試
+    test_ledger_server.cpp   # Stage 5c：端對端
+  )
 endif()
 
 target_link_libraries(ledger_tests
