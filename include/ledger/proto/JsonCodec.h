@@ -5,34 +5,37 @@
 namespace ledger::proto {
 
 // ---------------------------------------------------------------------------
-// JsonCodec —— NDJSON（一行一個 JSON 物件）。
+// JsonCodec — NDJSON, one JSON object per line.
 //
 //   {"v":1,"id":"7","type":"transfer","idem_key":"req-a3f9-01",
 //    "from":"1001","to":"2002","amount":"5000","ccy":"USD"}
 //
-// 三個保留 key：
-//   "v"     協定版本。可省略（省略即視為目前版本，方便手打測試）
-//   "id"    reqId，server 原樣抄回
-//   "type"  訊息名稱，見 kMsgTypeNames
+// Three reserved keys:
+//   "v"     protocol version. Optional — omitting it means "current", which
+//           keeps hand-typed testing bearable
+//   "id"    reqId, echoed back verbatim
+//   "type"  message name, see kMsgTypeNames
 //
-// 其餘的 key 來自訊息 struct 的 fields()。
+// Every other key comes from the message struct's fields().
 //
-// ★★ 所有整數一律編碼成字串。這不是風格潔癖，是正確性問題。
+// Every integer is encoded as a string. This is not tidiness, it is
+// correctness.
 //
-//   JavaScript 的 Number 是 IEEE-754 double，只能精確表示到 2^53。
-//   帳戶 id 和金額都是 int64。如果送裸數字：
+//   A JavaScript Number is an IEEE-754 double and is exact only up to 2^53.
+//   Account ids and amounts are int64. Sent as bare numbers:
 //
 //     JSON.parse('{"amount":9007199254740993}').amount
-//     // → 9007199254740992   ← 少了 1，沒有錯誤，沒有警告
+//     // -> 9007199254740992   one cent gone, no error, no warning
 //
-//   對記帳系統來說這是最難堪的 bug 種類 —— 它在金額還小的時候
-//   完全正常，等到數字變大才開始默默算錯。
+//   For a ledger that is the worst kind of bug: everything works while the
+//   numbers are small, and it starts quietly miscounting once they are not.
 //
-//   protobuf 的 canonical JSON mapping 也規定 int64 必須是字串。
-//   這不是巧合，是所有踩過這個坑的人得到的同一個結論。
+//   Protobuf's canonical JSON mapping requires int64 as a string too. That is
+//   not a coincidence; it is the conclusion everyone reaches after hitting this.
 //
-//   所以解碼時 **明確拒絕 JSON number 型別**。前端某天忘記加引號，
-//   我們要當場報錯，而不是「剛好這次沒超過 2^53 所以能動」。
+//   So decoding rejects JSON numbers in integer fields outright. If the
+//   frontend ever forgets the quotes, it should fail immediately rather than
+//   work by luck because the value happened to be under 2^53.
 // ---------------------------------------------------------------------------
 class JsonCodec final : public Codec {
  public:
@@ -41,7 +44,7 @@ class JsonCodec final : public Codec {
   [[nodiscard]] Result<RequestEnvelope> decodeRequest(std::string_view frame) const override;
   [[nodiscard]] Result<ResponseEnvelope> decodeResponse(std::string_view frame) const override;
 
-  /// 輸出含結尾換行，可以直接 send()。
+  /// The output ends with a newline and can be handed straight to send().
   [[nodiscard]] std::string encodeRequest(const RequestEnvelope& env) const override;
   [[nodiscard]] std::string encodeResponse(const ResponseEnvelope& env) const override;
 };

@@ -10,27 +10,31 @@
 namespace ledger::concurrent {
 
 // ---------------------------------------------------------------------------
-// ResponseSink —— worker 把結果交回去的地方。
+// ResponseSink — where a worker hands its result back.
 //
-// ★ 為什麼是一個抽象介面，而不是直接持有 net::Connection
+// Why an abstract interface rather than holding a net::Connection directly
 //
-//   Connection 屬於 net/，而 net/ 是 Linux 專屬（epoll）。Task 若直接
-//   依賴它，整個 concurrent/ 也會變成 Linux-only —— 而執行緒池恰好是
-//   最需要在各種環境反覆跑 TSan 的地方。
+//   Connection lives in net/, which is Linux-only because of epoll. If Task
+//   depended on it, all of concurrent/ would become Linux-only too — and the
+//   thread pool is precisely the code that benefits most from being run under
+//   TSan everywhere.
 //
-//   插一層純虛介面之後：
-//     - concurrent/ 保持平台無關，macOS 上也能完整測試
-//     - 測試可以用假的 sink，不需要真的 socket
-//     - weak_ptr 的語意完全保留（見下方 W2）
+//   With the interface in between:
+//     - concurrent/ stays platform-independent and fully testable on macOS
+//     - tests can use a fake sink and never open a socket
+//     - the weak_ptr semantics are preserved exactly (see W2 below)
 //
-// ⚠ deliver() 會被 worker 執行緒呼叫，所以實作必須是執行緒安全的。
+// deliver() is called from a worker thread, so implementations must be thread
+// safe.
 //
-//   Stage 5c 的實作只做兩件事：把位元組塞進 Connection 的 outputBuffer_
-//   （小 mutex 保護），然後 runInLoop 請 IO 執行緒去 write()。
-//   ★ worker 絕對不能自己 write(fd) —— 兩個 worker 同時寫同一個 socket，
-//     位元組會交織、長度前綴對不上、協定崩潰。而這不是 data race
-//     （write() 本身執行緒安全），所以 TSan 永遠抓不到。
-//     只能靠架構規則排除。
+//   The Stage 5c implementation does two things: append the bytes to the
+//   Connection's outputBuffer_ (guarded by a small mutex) and ask the IO thread
+//   to write via runInLoop.
+//
+//   A worker must never call write(fd) itself. Two workers writing the same
+//   socket interleave their bytes, the length prefixes stop lining up, and the
+//   protocol falls apart. That is not a data race — write() is thread safe — so
+//   TSan will never find it. Only the architectural rule prevents it.
 // ---------------------------------------------------------------------------
 class ResponseSink {
  public:
@@ -46,16 +50,16 @@ using ResponseSinkPtr = std::shared_ptr<ResponseSink>;
 using ResponseSinkWeakPtr = std::weak_ptr<ResponseSink>;
 
 // ---------------------------------------------------------------------------
-// Task —— 從 IO 執行緒交給 worker 的一個工作單元。
+// Task — one unit of work handed from the IO thread to a worker.
 //
-// ★ W2 不變式：worker 完成時連線可能已經不在。
+// W2: by the time a worker finishes, the connection may be gone.
 //
-//   client 可以在 worker 還在等 DB 的那 1.5 毫秒裡斷線。若 Task 持有
-//   shared_ptr，連線物件會被硬留到 worker 做完 —— 對已死的連線做事、
-//   而且延後釋放 fd。若持有裸指標，那就是 use-after-free。
+//   A client can disconnect during the 1.5 ms a worker spends waiting on the
+//   database. A shared_ptr here would pin the dead connection object — and its
+//   fd — until the worker finishes. A raw pointer would be a use-after-free.
 //
-//   weak_ptr 是唯一正確的選擇：worker 完成後 lock() 升級，
-//   失效就安靜丟棄結果。
+//   weak_ptr is the only correct choice: the worker locks it on completion and
+//   quietly drops the result if it has expired.
 // ---------------------------------------------------------------------------
 struct Task {
   using Clock = std::chrono::steady_clock;
@@ -64,11 +68,12 @@ struct Task {
   proto::RequestEnvelope request;
   proto::CodecTag codec{proto::CodecTag::Binary};
 
-  /// 進佇列的時刻。
+  /// When this entered the queue.
   ///
-  /// worker 取出時的 now() 減掉它，就是「排隊等了多久」——
-  /// 這個數字跟「處理花了多久」是兩回事，而且在過載時它才是主角。
-  /// Stage 8 要分開量這兩段，否則會把排隊延遲誤認為處理慢。
+  /// now() minus this at pop time is the queueing delay, which is a different
+  /// number from the processing time — and under overload it is the one that
+  /// dominates. Stage 8 measures them separately, otherwise queueing delay
+  /// gets misdiagnosed as slow processing.
   Clock::time_point enqueuedAt{Clock::now()};
 
   Task() = default;

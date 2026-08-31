@@ -9,58 +9,64 @@
 namespace ledger::proto {
 
 // ---------------------------------------------------------------------------
-// Field —— 一個訊息欄位的靜態描述。
+// Field — a static description of one message field.
 //
-// 這是整個 proto 層的地基，也是唯一一處「聰明」的程式碼。存在的理由只有一個：
-// 讓每個欄位在整份程式裡只被宣告一次。
+// This is the foundation of the protocol layer and the only clever code in it.
+// It exists for exactly one reason: so that every field is declared once.
 //
-// 沒有它的話，加一個欄位要改四個地方（binary encode / binary decode /
-// json encode / json decode），而漏掉其中一個是靜默的 —— 編譯過、
-// 該編碼的測試也過，只有另一種編碼少一個欄位，可能幾週後才被發現。
+// Without it, adding a field means editing four places (binary encode, binary
+// decode, JSON encode, JSON decode), and missing one of the four is silent —
+// it compiles, that encoding's tests pass, and only the *other* encoding is
+// quietly short a field. It might be weeks before anyone notices.
 //
-// 有了它，兩個 codec 都只是「走訪 fields() 並依型別分派」的泛型程式碼，
-// 欄位清單物理上只存在於訊息 struct 自己身上。
+// With it, both codecs are generic code that walks fields() and dispatches on
+// the field type. The list of fields physically exists in one place: the
+// message struct itself.
 //
-// ⚠ 這一層刻意保持極小 —— 只有一個 struct 和兩個 helper，沒有 concept、
-//   沒有 CRTP、沒有巨集。template 程式碼的編譯錯誤訊息很難讀，
-//   它換來的維護性必須明顯大於它增加的閱讀成本，否則就是負債。
+// This layer is deliberately tiny — one struct and two helpers, no concepts,
+// no CRTP, no macros. Template code produces error messages that are hard to
+// read, so the maintainability it buys has to clearly outweigh the cost of
+// reading it. Beyond this, it would not.
 // ---------------------------------------------------------------------------
 
-/// 一個欄位 = 它在協定裡的名字 + 指向它的成員指標。
+/// A field is its name in the protocol plus a pointer to the member.
 ///
 ///   Field{"amount", &TransferReq::amount}
 ///
-/// name 決定 JSON 的 key；在 fields() 裡的「位置」決定 binary 的順序。
+/// The name determines the JSON key. The *position* within fields() determines
+/// the binary order.
 ///
-/// ⚠ 重排 fields() 裡的順序會靜默破壞 binary 相容性（JSON 不受影響，
-///   因為它靠名字對應）。test_codec.cpp 的 golden hex 表格就是防這件事的。
+/// Reordering fields() silently breaks binary compatibility while leaving JSON
+/// untouched, since JSON matches on names. The golden hex table in
+/// test_codec.cpp exists to catch exactly that.
 template <typename Class, typename Member>
 struct Field {
   std::string_view name;
   Member Class::*member;
 };
 
-// C++20 的 aggregate CTAD 讓 Field{"x", &T::m} 不用寫模板參數。
+// C++20 aggregate CTAD, so Field{"x", &T::m} needs no template arguments.
 template <typename Class, typename Member>
 Field(std::string_view, Member Class::*) -> Field<Class, Member>;
 
-/// 依序對 Msg 的每個欄位描述呼叫 fn。
+/// Call fn with each of Msg's field descriptors, in order.
 ///
-/// 逗號 fold 的求值順序由標準保證是由左到右 —— 這一點對 binary 編碼
-/// 是正確性關鍵，欄位順序錯了整個 payload 就錯位了。
+/// The standard guarantees left-to-right evaluation for a comma fold. For
+/// binary encoding that is a correctness requirement, not a style preference:
+/// get the order wrong and the whole payload is misaligned.
 template <typename Msg, typename Fn>
 constexpr void forEachField(Fn&& fn) {
   std::apply([&fn](auto&&... field) { (fn(field), ...); }, Msg::fields());
 }
 
-/// Msg 宣告了幾個欄位。
+/// How many fields Msg declares.
 template <typename Msg>
 [[nodiscard]] constexpr std::size_t fieldCount() {
   return std::tuple_size_v<decltype(Msg::fields())>;
 }
 
-/// 給 if constexpr 的窮盡檢查用：碰到沒支援的欄位型別時在編譯期報錯，
-/// 而不是安靜地漏掉那個欄位。
+/// For exhaustiveness checks in `if constexpr` chains: an unsupported field
+/// type becomes a compile error rather than a field that is silently skipped.
 template <typename>
 inline constexpr bool kAlwaysFalse = false;
 

@@ -14,44 +14,47 @@
 namespace ledger::proto {
 
 // ---------------------------------------------------------------------------
-// 協定的訊息型別。
+// The protocol's message types.
 //
-// 這裡定義的是「中立值型別」—— 它們不知道 binary，也不知道 JSON。
-// BinaryCodec 和 JsonCodec 是翻譯機，LedgerCore 和 worker 只看得到這些型別。
+// These are neutral value types: they know nothing about binary and nothing
+// about JSON. BinaryCodec and JsonCodec are translators; LedgerCore and the
+// workers only ever see these.
 //
-// 好處在 Stage 6 才會完全顯現：接上 DB 之後業務邏輯只有一份，
-// 不會因為多支援一種編碼而多一倍的整合測試。
+// The benefit only becomes obvious in Stage 6: with the database wired in,
+// there is still exactly one copy of the business logic, and supporting a
+// second encoding does not double the integration tests.
 // ---------------------------------------------------------------------------
 
-/// 協定版本。不相符的請求直接回 UnsupportedVersion 並關連線。
+/// Protocol version. A mismatched request is rejected and the connection closed.
 ///
-/// 為什麼要現在就決定語意：Stage 0 定了 ver 欄位卻沒說不合怎麼辦，
-/// 那它就會變成一個永遠是 1 的死欄位。定成「不合就拒絕」只要兩行，
-/// 但讓這個欄位真的有作用。
+/// Deciding the semantics now matters: Stage 0 specified a ver field but not
+/// what to do when it disagrees, which would have left it a dead field that is
+/// always 1. "Mismatch means reject" costs two lines and makes it real.
 inline constexpr std::uint16_t kProtocolVersion = 1;
 
-/// 單則訊息的位元組上限。
+/// Upper bound on one message.
 ///
-/// NDJSON 沒有長度前綴，所以更需要這個 —— 沒有上限的話，
-/// 一個永遠不送換行的 client 可以讓 Buffer 無限成長直到 OOM。
+/// NDJSON needs this more than the binary port does: with no length prefix, a
+/// client that never sends a newline can grow the buffer without limit.
 inline constexpr std::size_t kMaxFrameSize = 64 * 1024;
 
-/// 冪等鍵的長度上限。binary 用 u16 存長度，這裡定得更嚴。
+/// Upper bound on an idempotency key. Binary stores its length in a u16; this
+/// is deliberately stricter.
 inline constexpr std::size_t kMaxIdemKeyLength = 128;
 
 // ---------------------------------------------------------------------------
-// 訊息代碼。最高位元 = 1 表示這是回應。
+// Message codes. The high bit means "this is a response".
 //
-// 數值一旦發布就不能改 —— client 和 Locust 腳本都會依賴它。
-// 新增訊息一律往後加，永不重用舊值。
+// These numbers are frozen once published — clients and the Locust script
+// depend on them. New messages are appended; old values are never reused.
 // ---------------------------------------------------------------------------
 enum class MsgType : std::uint16_t {
-  // --- 請求 ---
+  // --- requests ---
   Ping = 0x0001,
   Transfer = 0x0002,
   GetAccount = 0x0003,
 
-  // --- 回應 ---
+  // --- responses ---
   Pong = 0x8001,
   TransferOk = 0x8002,
   Account = 0x8003,
@@ -62,17 +65,18 @@ enum class MsgType : std::uint16_t {
   return (static_cast<std::uint16_t>(t) & 0x8000U) != 0;
 }
 
-/// 帳戶狀態。與 db/migrations/002_accounts.sql 的 status 欄位對應。
+/// Account state. Mirrors the status column in db/migrations/002_accounts.sql.
 enum class AccountStatus : std::uint8_t {
   Active = 0,
   Closed = 1,
 };
 
 // ---------------------------------------------------------------------------
-// MsgType ↔ 名字。JSON 的 "type" 欄位用這張表。
+// MsgType <-> name, used for the JSON "type" field.
 //
-// 刻意做成一張陣列而不是兩個 switch —— 雙向查找共用同一份資料，
-// 不可能出現「encode 用新名字、decode 只認得舊名字」的漂移。
+// One array rather than two switch statements: both directions read the same
+// data, so there is no way to end up encoding a new name while only decoding
+// the old one.
 // ---------------------------------------------------------------------------
 struct MsgTypeName {
   MsgType type;
@@ -93,17 +97,18 @@ inline constexpr MsgTypeName kMsgTypeNames[] = {
 [[nodiscard]] Result<MsgType> msgTypeFromName(std::string_view name) noexcept;
 
 // ---------------------------------------------------------------------------
-// 請求訊息
+// Requests
 // ---------------------------------------------------------------------------
 
-/// 心跳。沒有負載，用途是驗證整條路（切包 → 解碼 → 佇列 → worker → 回程）
-/// 在不碰帳本的情況下是通的。壓測暖機也用它。
+/// Heartbeat. No payload. It verifies the whole path — framing, decoding,
+/// queue, worker, response — without touching the ledger, and it is what the
+/// load test uses to warm up.
 struct PingReq {
   static constexpr MsgType kType = MsgType::Ping;
   static constexpr auto fields() { return std::tuple{}; }
 };
 
-/// 轉帳。這是整個系統存在的理由。
+/// A transfer. The reason this system exists.
 struct TransferReq {
   std::string idemKey;
   AccountId from{0};
@@ -113,9 +118,9 @@ struct TransferReq {
 
   static constexpr MsgType kType = MsgType::Transfer;
 
-  // ★ 欄位只在這裡宣告一次。
-  //   binary 的順序 = 這個 tuple 的順序；JSON 的 key = 這裡的字串。
-  //   兩種編碼不可能對不上，因為它們讀的是同一份描述。
+  // Declared once. Binary order is this tuple's order; JSON keys are these
+  // strings. The two encodings cannot disagree, because they read the same
+  // description.
   static constexpr auto fields() {
     return std::tuple{
         Field{"idem_key", &TransferReq::idemKey},
@@ -127,7 +132,8 @@ struct TransferReq {
   }
 };
 
-/// 查單一帳戶。純讀路徑，Stage 6 之後它完全不碰 DB。
+/// Look up one account. A pure read; even after Stage 6 it never touches the
+/// database.
 struct GetAccountReq {
   AccountId accountId{0};
 
@@ -141,7 +147,7 @@ struct GetAccountReq {
 };
 
 // ---------------------------------------------------------------------------
-// 回應訊息
+// Responses
 // ---------------------------------------------------------------------------
 
 struct PongResp {
@@ -183,10 +189,11 @@ struct AccountResp {
   }
 };
 
-/// 錯誤回應。
+/// An error response.
 ///
-/// code 直接用 common/Result.h 的 ErrorCode —— 刻意不在 proto 層再定義
-/// 一套對應表。多一張表就多一個會漂移的地方，而且轉譯本身也是 bug 來源。
+/// The code is the ErrorCode from common/Result.h rather than a protocol-local
+/// enum. A second table is a second thing that can drift, and the translation
+/// between them would be its own source of bugs.
 struct ErrorResp {
   ErrorCode code{ErrorCode::Ok};
   std::string message;
@@ -202,18 +209,21 @@ struct ErrorResp {
 };
 
 // ---------------------------------------------------------------------------
-// 信封 —— 訊息本體加上跨訊息共通的表頭欄位。
+// Envelopes — a message plus the header fields common to all of them.
 //
-// ★ reqId 是 Stage 0 原始設計漏掉的東西。
+// reqId was missing from the original Stage 0 design.
 //
-//   Echo server 時代不需要它：回應就是原樣回送，配對是隱含的。
-//   但 20 個 worker 平行處理之後，回應順序必然是亂的 —— client 連送
-//   三筆轉帳，第三筆可能最先回來。沒有關聯 id，client 根本無法把
-//   回應配對回請求。
+//   The echo server did not need it: the response *was* the request, so the
+//   correlation was implicit. But with twenty workers running in parallel the
+//   response order is necessarily scrambled — send three transfers and the
+//   third may come back first. Without a correlation id a client simply cannot
+//   match responses to requests.
 //
-//   reqId 跟 idempotency_key 是兩回事：
-//     reqId    —— 只在單一連線內配對用。可重複、不持久化、server 原樣抄回。
-//     idemKey  —— 跨連線、跨重啟的去重保證。寫進 DB 的 UNIQUE 索引。
+//   reqId and idempotency_key are different things:
+//     reqId   correlation within one connection. May repeat, is not persisted,
+//             and the server echoes it back verbatim.
+//     idemKey the deduplication guarantee across connections and restarts.
+//             It goes into a UNIQUE index in the database.
 // ---------------------------------------------------------------------------
 using Request = std::variant<PingReq, TransferReq, GetAccountReq>;
 using Response = std::variant<PongResp, TransferOkResp, AccountResp, ErrorResp>;
@@ -228,11 +238,11 @@ struct ResponseEnvelope {
   Response body;
 };
 
-/// 取出信封裡實際裝的訊息代碼。
+/// The message code of whatever the envelope actually holds.
 [[nodiscard]] MsgType typeOf(const Request& req) noexcept;
 [[nodiscard]] MsgType typeOf(const Response& resp) noexcept;
 
-/// 產生一個錯誤回應的捷徑 —— 這在兩個 codec 和 Stage 5c 都會反覆用到。
+/// Shorthand for an error response, used by both codecs and by Stage 5c.
 [[nodiscard]] ResponseEnvelope makeError(std::uint32_t reqId,
                                          ErrorCode code,
                                          std::string message = {});

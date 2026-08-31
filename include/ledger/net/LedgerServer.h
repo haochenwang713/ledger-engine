@@ -19,35 +19,37 @@
 namespace ledger::net {
 
 // ---------------------------------------------------------------------------
-// ConnectionContext —— 一條連線的協定狀態，以及它的回程通道。
+// ConnectionContext — one connection's protocol state and its return path.
 //
-// ★ 生命週期與所有權（這一段是整個 Stage 5c 最容易寫錯的地方）
+// Ownership, which is the easiest thing in Stage 5c to get wrong:
 //
-//     LedgerServer::connections_  ──shared_ptr──▶  Connection
-//                                                      │
-//                                        messageCb_ 捕捉 shared_ptr
-//                                                      ▼
-//                                              ConnectionContext
-//                                                      │
-//                                                 weak_ptr（★）
-//                                                      ▼
-//                                                 Connection
+//     LedgerServer::connections_  --shared-->  Connection
+//                                                  |
+//                                 the read callback captures shared
+//                                                  v
+//                                          ConnectionContext
+//                                                  |
+//                                             weak  <-- must not be shared
+//                                                  v
+//                                             Connection
 //
-//   context 對 Connection 只能持 weak_ptr。持 shared_ptr 的話就形成
-//   循環參照 —— 兩者互相持有，引用計數永遠不歸零，每一條斷掉的連線
-//   都會永久洩漏它的 fd 與緩衝。這種洩漏不會崩潰，只會讓行程慢慢腫大，
-//   壓測跑幾分鐘後才發現。
+//   The context may only hold the Connection weakly. A shared_ptr there is a
+//   reference cycle: the two hold each other, the count never reaches zero, and
+//   every closed connection leaks its fd and its buffers. That leak never
+//   crashes — the process just grows, and it takes a few minutes of load
+//   testing to notice.
 //
-//   反過來，Task 對 context 持 weak_ptr（ResponseSinkWeakPtr）。
-//   client 斷線 → server 從 connections_ 移除 → Connection 銷毀
-//   → 它的回呼銷毀 → context 銷毀 → worker 手上的 weak_ptr 失效
-//   → 結果被安靜丟棄。這就是 W2 不變式的完整鏈條。
+//   In the other direction, each Task holds the context weakly. Client
+//   disconnects -> server erases it from connections_ -> Connection destroyed
+//   -> its callbacks destroyed -> context destroyed -> the worker's weak_ptr
+//   expires -> the result is dropped. That is the whole W2 chain.
 //
-// ⚠ 執行緒歸屬：
-//     onMessage()  只在 IO 執行緒上執行
-//     deliver()    只在 worker 執行緒上執行
-//   兩者之間唯一的共享是 Connection::send()，而它本身是執行緒安全的
-//   （內部小 mutex + runInLoop）。context 自己沒有任何可變狀態需要保護。
+// Thread affinity:
+//     onMessage()  runs only on the IO thread
+//     deliver()    runs only on worker threads
+//   The only thing they share is Connection::send(), which is itself thread
+//   safe (small mutex plus runInLoop). The context has no mutable state of its
+//   own to protect.
 // ---------------------------------------------------------------------------
 class ConnectionContext : public concurrent::ResponseSink,
                           public std::enable_shared_from_this<ConnectionContext> {
@@ -58,43 +60,47 @@ class ConnectionContext : public concurrent::ResponseSink,
                     concurrent::ThreadPool& pool)
       : conn_(conn), session_(splitter, codec), codec_(codec), pool_(pool) {}
 
-  /// 在 IO 執行緒上被呼叫。切包、解碼、丟進 worker 佇列。
+  /// Called on the IO thread. Frame, decode, hand to a worker.
   void onMessage(Buffer& buffer);
 
-  /// 在 worker 執行緒上被呼叫。編碼並交給 Connection 送出。
+  /// Called on a worker thread. Encode and give it to the Connection.
   void deliver(const proto::ResponseEnvelope& resp, proto::CodecTag codec) override;
 
  private:
-  /// 編碼一則回應並送出。conn 已經失效就安靜丟棄。
+  /// Encode one response and send it. Drops it silently if the connection is
+  /// already gone.
   void sendResponse(const proto::ResponseEnvelope& resp);
 
-  std::weak_ptr<Connection> conn_;  ///< ★ 必須是 weak，見上方說明
+  std::weak_ptr<Connection> conn_;  ///< must be weak; see above
   proto::Session session_;
   const proto::Codec& codec_;
   concurrent::ThreadPool& pool_;
 };
 
 // ---------------------------------------------------------------------------
-// LedgerServer —— 把網路層、協定層、執行緒池、帳本核心黏起來。
+// LedgerServer — glue between the network layer, the protocol, the pools and
+// the ledger core.
 //
-// ★ 兩個 port，兩組完全獨立的執行緒池
+// Two ports, two entirely separate thread pools
 //
-//     :9000  長度前綴 + binary   →  ThreadPool("binary", 20 workers)
-//     :9001  換行分隔 + NDJSON   →  ThreadPool("json",    4 workers)
+//     :9000  length prefix + binary  ->  ThreadPool("binary", 20 workers)
+//     :9001  newline + NDJSON        ->  ThreadPool("json",    4 workers)
 //
-//   隔離的理由：JSON port 是給人用的除錯與前端入口，binary port 是
-//   壓測與正式流量。共用一個佇列的話，前端有人狂點就會排擠壓測流量，
-//   讓 Stage 8 的數字變髒。
+//   The isolation matters because the JSON port is the debugging and frontend
+//   entrance while the binary port carries load tests and real traffic. Sharing
+//   one queue means somebody clicking around in a frontend crowds out the load
+//   test and dirties the Stage 8 numbers.
 //
-//   獨立的池比獨立的佇列更強：不只佇列隔離，連執行緒都隔離，
-//   所以「前端一個慢查詢卡住壓測 worker」在結構上不可能發生。
-//   代價是多 4 條執行緒與 4 條 DB 連線（Stage 6），可以忽略。
+//   Separate pools are stronger than separate queues: threads are isolated too,
+//   so "a slow frontend query ties up a load-test worker" is structurally
+//   impossible. The cost is four extra threads and, in Stage 6, four extra
+//   database connections. Negligible.
 //
-// ★ 一個 EventLoop 服務兩個 port
+// One EventLoop serves both ports
 //
-//   兩個 Acceptor 註冊在同一個 epoll 上。IO 完全不是瓶頸
-//   （每筆請求在 IO 執行緒上只花約 0.05 ms 的解析時間），
-//   多開一條 loop 執行緒只會增加除錯難度。
+//   Both acceptors register on the same epoll. IO is nowhere near the
+//   bottleneck — a request spends about 0.05 ms of parsing on the IO thread —
+//   and a second loop thread would only make debugging harder.
 // ---------------------------------------------------------------------------
 class LedgerServer {
  public:
@@ -123,8 +129,8 @@ class LedgerServer {
 
   Status start();
 
-  /// 停止兩個執行緒池，等待佇列排空。
-  /// 必須在 EventLoop::run() 返回之後呼叫。
+  /// Stop both pools and wait for their queues to drain.
+  /// Must be called after EventLoop::run() has returned.
   void shutdown();
 
   [[nodiscard]] std::uint16_t binaryPort() const noexcept { return binaryAcceptor_.port(); }
@@ -151,7 +157,8 @@ class LedgerServer {
   Acceptor binaryAcceptor_;
   Acceptor jsonAcceptor_;
 
-  // 切包器與 codec 都是無狀態的純函式物件，全連線共用一份。
+  // Splitters and codecs are stateless pure-function objects; one of each is
+  // shared by every connection.
   proto::LengthPrefixSplitter lengthSplitter_;
   proto::NewlineSplitter newlineSplitter_;
   proto::BinaryCodec binaryCodec_;
@@ -160,12 +167,14 @@ class LedgerServer {
   concurrent::ThreadPool binaryPool_;
   concurrent::ThreadPool jsonPool_;
 
-  /// 伺服器持有每條連線的 shared_ptr。從這裡移除，就是它被銷毀的時刻。
-  /// 只有 loop 執行緒會碰，不需要鎖。
+  /// The server holds each connection's shared_ptr. Erasing from here is the
+  /// moment the connection is destroyed. Only the loop thread touches it, so no
+  /// lock is needed.
   std::unordered_map<int, ConnectionPtr> connections_;
 
-  /// connections_.size() 的 atomic 鏡像，供其他執行緒安全讀取。
-  /// 直接讀 map 的 size 是資料競爭，TSan 會抓（Stage 4 就踩過）。
+  /// An atomic mirror of connections_.size() for other threads to read.
+  /// Reading the map's size directly is a data race, and TSan catches it —
+  /// Stage 4 already stepped on this.
   std::atomic<std::size_t> activeCount_{0};
 };
 

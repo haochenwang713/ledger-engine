@@ -5,9 +5,9 @@ multi-currency account transfers over a hand-rolled epoll event loop, prevents
 double-spending under concurrent load, and guarantees that every transfer is
 recorded as a balanced pair of immutable journal entries.
 
-> **Status:** Stage 5 of 9 — the wire protocol and the worker pool are done and
-> clean under both sanitizers; wiring them into the event loop is next. See
-> [Roadmap](#roadmap) for the rest.
+> **Status:** Stage 5 of 9 — the server is live. Two ports, twenty-four worker
+> threads, an in-memory ledger, and `nc` is a working client. PostgreSQL is
+> next. See [Roadmap](#roadmap) for the rest.
 
 ---
 
@@ -361,6 +361,100 @@ notification and a lock-order deadlock both manifest as *never returning*, not
 as a failed assertion — the assertion never gets a chance to run, so the
 timeout is the only thing that can judge them.
 
+## Talking to it
+
+The JSON port exists so that the server can be driven by hand. Start it and
+point `nc` at port 9001:
+
+```
+$ ./build/src/ledger_engine
+ledger engine up
+  binary  port 9000  (length-prefixed)
+  json    port 9001  (NDJSON, one object per line)
+  workers 20 binary / 4 json (independent queues)
+  accounts 5 loaded
+
+$ nc localhost 9001
+{"id":"1","type":"get_account","account_id":"1001"}
+{"balance":"115000","ccy":"USD","id":"1001","status":"ACTIVE","type":"account","v":1}
+
+{"id":"2","type":"transfer","idem_key":"k1","from":"1001","to":"2002","amount":"2500","ccy":"USD"}
+{"from_balance":"112500","id":"2","to_balance":"49500","tx_id":"900004","type":"transfer_ok","v":1}
+
+{"id":"3","type":"transfer","idem_key":"k2","from":"2002","to":"1001","amount":"99999999","ccy":"USD"}
+{"code":"INSUFFICIENT_FUNDS","id":"3","message":"INSUFFICIENT_FUNDS","type":"error","v":1}
+```
+
+Ctrl-C prints what the run did and re-checks the ledger:
+
+```
+stopped.
+  json     6 handled, 0 refused (queue full), 0 dropped (client gone)
+  transfers 5 committed / 1 rejected
+  invariants passed — the ledger balances
+```
+
+The demo accounts are the ones from the design document and from
+`db/seeds/dev_seed.sql`: Alice at 115000 USD, Bob at 47000, and a JPY account
+holding 5000 — which is ¥5,000, not ¥50.00, because JPY has exponent 0. They
+are created by transferring out of a system account rather than by setting
+balances directly, so I2 holds from the very first row. Stage 6 replaces that
+function with `SELECT id, balance FROM accounts` and the same commands should
+produce the same answers.
+
+## Two kinds of protocol failure
+
+Turning a byte stream into requests means deciding what to do when the bytes
+are wrong, and there are two different answers:
+
+| | What it means | What to do |
+|---|---|---|
+| **Decode error** | The frame boundary is known, the contents are not understood | Reply with an error, skip that one message, keep the connection |
+| **Framing error** | The length field is nonsense, or a line never ends — the stream can no longer be aligned | Reply, then close the connection |
+
+Treating a framing error as recoverable puts the connection into a loop:
+garbage in, error out, more garbage in. There is no way to find where the next
+message starts, so continuing to read only produces more noise.
+
+Connection lifetime has a matching pair of rules, and both directions have to
+be weak:
+
+```
+LedgerServer::connections_ ──shared──▶ Connection
+                                          │  the read callback captures shared
+                                          ▼
+                                   ConnectionContext
+                                          │  weak  ←── must not be shared
+                                          ▼
+                                     Connection
+```
+
+A `shared_ptr` back to the `Connection` would be a reference cycle: the count
+never reaches zero and every closed connection leaks its fd and its buffers.
+That failure never crashes — the process just grows, and only a long load test
+notices. In the other direction each queued `Task` holds the context weakly, so
+a client that disconnects while its transfer is still queued gets its result
+discarded rather than written to a dead socket.
+
+## What Stage 5c's tests prove
+
+Eighteen of these use real sockets against a real server with real worker
+threads. The most useful one is `ConcurrentClientsPreserveTotalMoney`: eight
+clients, half transferring 1001→2002 and half 2002→1001 — precisely the pattern
+that deadlocks a naive lock-the-source-first implementation. It exercises the
+event loop, both codecs, the queue, the ordered locking, and the response
+routing at once, and then asserts that the two balances still sum to what they
+did before. Every fixture teardown re-checks the invariants.
+
+`SurvivesClientsDisconnectingMidFlight` fires fifty requests and hangs up
+without reading any of them. `FramingErrorClosesTheConnection` sends
+`len = 0xFFFFFFFF` and expects a FIN. `GarbageLineGetsAnErrorButKeepsTheConnection`
+sends nonsense and then a valid ping on the same socket.
+
+None of `net/` changed in this stage. The event loop, the acceptor, the
+connection, and the buffer are byte-for-byte what Stage 4 delivered — which was
+the point of building the echo server without a protocol in the first place.
+
 ## Development
 
 ```bash
@@ -409,8 +503,8 @@ raises is usually pointing at a code path the other one never compiles.
 | 2 | DB schema: `currencies` / `accounts` / `transactions` / `entries` | ✅ Done |
 | 3 | Ledger core — in-memory, `shared_mutex`, no DB yet | ✅ Done |
 | 4 | epoll TCP server (echo first) | ✅ Done |
-| 5 | Wire protocol framing + thread pool | 🔶 5a/5b done, wiring next |
-| 6 | PostgreSQL integration with `SELECT … FOR UPDATE` | ⬜ |
+| 5 | Wire protocol framing + thread pool | ✅ Done |
+| 6 | PostgreSQL integration with `SELECT … FOR UPDATE` | ⬜ Next |
 | 7 | ThreadSanitizer / AddressSanitizer verification | ⬜ |
 | 8 | Locust load tests, tuning, TPS and p95 numbers | ⬜ |
 | 9 | Architecture diagrams, final documentation | ⬜ |

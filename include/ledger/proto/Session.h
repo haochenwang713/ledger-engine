@@ -11,56 +11,59 @@
 namespace ledger::proto {
 
 // ---------------------------------------------------------------------------
-// Session —— 把一串位元組變成一串請求。
+// Session — turn a run of bytes into a run of requests.
 //
-// 這是 Stage 5c 唯一有邏輯的地方，也刻意做成平台無關：它不知道 socket、
-// 不知道執行緒、不持有狀態。輸入是「目前累積的位元組」，輸出是
-// 「解出了哪些請求、要消費幾個位元組、有沒有要立刻回的錯誤」。
+// This is the only place in Stage 5c with real branching, and it is
+// deliberately platform-independent: it knows nothing about sockets, nothing
+// about threads, and holds no state. In go the bytes accumulated so far; out
+// come the requests decoded, how many bytes to consume, and any errors that
+// should be answered immediately.
 //
-// 為什麼把這個迴圈單獨抽出來，而不是寫在 ConnectionContext 裡：
-// 半包、黏包、解碼失敗、框架失敗這四種情況的組合是這一層最容易寫錯的
-// 地方，而 ConnectionContext 依賴 Connection（Linux 專屬）。抽出來之後
-// 這段邏輯在 macOS 上也能完整測試，而且測試不需要任何 socket。
+// The loop is pulled out of ConnectionContext rather than written inline
+// because the combination of partial frames, glued frames, decode failures and
+// framing failures is the easiest thing in this layer to get wrong — and
+// ConnectionContext depends on Connection, which is Linux-only. Extracted, all
+// of this is testable on macOS with no socket involved.
 //
-// ★ 兩種失敗的處理方式完全不同
+// The two kinds of failure are handled in opposite ways:
 //
-//   解碼失敗（frame 切得出來，但內容看不懂）
-//     → 框架邊界是已知的，可以跳過這一則繼續下一則。
-//       回一個 ERROR 給 client，連線繼續活著。
+//   Decode error — the frame boundary is known, the contents are not understood
+//     Skip that message and continue with the next. Reply with an error; the
+//     connection stays up.
 //
-//   框架失敗（長度欄位不合理、單則訊息超長）
-//     → 我們不知道下一則訊息從哪裡開始，位元組流已經無法對齊。
-//       繼續讀下去只會產生垃圾。唯一正確的做法是關閉連線。
+//   Framing error — we no longer know where the next message begins
+//     The byte stream cannot be realigned, so reading on produces only noise.
+//     Reply, then close the connection.
 //
-//   混淆這兩者的後果：把框架失敗當成可恢復的，會讓連線陷入
-//   「解出垃圾 → 回錯誤 → 再解出垃圾」的無限迴圈。
+//   Confusing the two puts the connection in a loop: garbage in, error out,
+//   more garbage in, forever.
 // ---------------------------------------------------------------------------
 class Session {
  public:
   struct Outcome {
-    /// 成功解出、應該送去 worker 處理的請求。
+    /// Decoded successfully; should be handed to a worker.
     std::vector<RequestEnvelope> requests;
 
-    /// 應該立刻回給 client 的錯誤（不經過 worker）。
+    /// Should be sent straight back to the client, bypassing the workers.
     std::vector<ResponseEnvelope> errors;
 
-    /// 應該從緩衝消費掉多少位元組。半包的部分不算在內。
+    /// How many bytes to consume. Partial frames are not counted.
     std::size_t consumed{0};
 
-    /// 位元組流已經無法對齊，連線必須關閉。
+    /// The stream cannot be realigned; the connection must be closed.
     bool fatal{false};
   };
 
-  /// splitter 與 codec 都是無狀態的，由伺服器持有一份共用。
+  /// Both the splitter and the codec are stateless and shared by the server.
   Session(const FrameSplitter& splitter, const Codec& codec) noexcept
       : splitter_(splitter), codec_(codec) {}
 
-  /// 從累積的位元組裡盡可能多切出請求。
+  /// Pull as many requests as possible out of the accumulated bytes.
   ///
-  /// ⚠ 呼叫端必須在處理完 outcome 之後才 retrieve(consumed)。
-  ///   Outcome 裡的 RequestEnvelope 是值型別（已經複製過了），
-  ///   所以它們不依賴輸入緩衝的存活 —— 這是刻意的，因為那些請求
-  ///   會被丟進佇列，可能在幾毫秒後才被別的執行緒讀到。
+  /// The caller retrieves(consumed) after handling the outcome. The
+  /// RequestEnvelopes are values — already copied during decoding — so they do
+  /// not depend on the input buffer staying alive. That is deliberate: they go
+  /// onto a queue and may be read by another thread milliseconds later.
   [[nodiscard]] Outcome drain(std::string_view input) const;
 
   [[nodiscard]] CodecTag codecTag() const noexcept { return codec_.tag(); }

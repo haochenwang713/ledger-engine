@@ -9,10 +9,11 @@
 
 namespace ledger::proto {
 
-/// 一則訊息是從哪一種編碼進來的。
+/// Which encoding a message arrived in.
 ///
-/// Task 會帶著它跑完整趟 worker 流程，回程時用同一個 codec 編碼回去。
-/// 少了它，worker 就得知道自己在服務哪個 port —— 那是不該有的耦合。
+/// A Task carries this through the whole worker round trip so the response can
+/// go back out in the same encoding. Without it, workers would have to know
+/// which port they are serving — a coupling that does not belong there.
 enum class CodecTag : std::uint8_t {
   Binary,
   Json,
@@ -21,20 +22,23 @@ enum class CodecTag : std::uint8_t {
 [[nodiscard]] std::string_view nameOf(CodecTag tag) noexcept;
 
 // ---------------------------------------------------------------------------
-// Codec —— 位元組與中立訊息型別之間的翻譯機。
+// Codec — the translator between bytes and the neutral message types.
 //
-// 四個方法而不是兩個，是因為 server 與 client 兩邊都要用：
-//   server 走 decodeRequest / encodeResponse
-//   client 走 encodeRequest / decodeResponse（Stage 8 的 Locust TCP client
-//          會需要，測試的 round-trip 也需要）
+// Four methods rather than two, because both sides need it:
+//   server: decodeRequest / encodeResponse
+//   client: encodeRequest / decodeResponse  (the Stage 8 Locust TCP client
+//           needs these, and so do the round-trip tests)
 //
-// 全部標成 const 且不持有狀態 —— codec 可以被多執行緒同時使用，
-// 一個行程只需要各一份。這是「純函式」這個設計選擇帶來的直接好處。
+// Every method is const and no codec holds state, so one instance per process
+// can be shared across all threads. That falls straight out of choosing pure
+// functions here.
 //
-// ⚠ 輸入的 frame 是「一則訊息的位元組」，框架開銷已由 FrameSplitter 剝除。
-//   輸出則相反：encode 出來的字串「含」框架開銷，可以直接 send()。
-//   之所以不對稱，是因為解碼時切包與解碼是分開的兩步（要先知道界線才能解），
-//   而編碼時長度只有寫完 payload 才知道，硬拆成兩步反而要多一次複製。
+// Note the asymmetry: the frame handed to decode has already had its framing
+// stripped by FrameSplitter, while encode returns bytes *with* framing,
+// ready to hand to send(). Decoding is two steps because you must know where a
+// message ends before you can read it; encoding is one because the length is
+// only known once the payload is written, and splitting it would just force an
+// extra copy.
 // ---------------------------------------------------------------------------
 class Codec {
  public:

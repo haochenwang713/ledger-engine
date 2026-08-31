@@ -35,6 +35,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       clang-tidy \
       linux-tools-common \
       curl \
+      # NDJSON port 是設計來給人手動操作的，但那需要一個 client。
+      # 沒有它的話，這個專案最好展示的一段（開一條連線、打一行 JSON、
+      # 看著餘額變動）在容器裡根本做不出來。
+      netcat-openbsd \
+      # 把單行 JSON 排版成看得懂的樣子：nc localhost 9001 | jq
+      jq \
       ca-certificates \
       vim \
       less \
