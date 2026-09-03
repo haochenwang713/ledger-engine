@@ -53,11 +53,13 @@ enum class MsgType : std::uint16_t {
   Ping = 0x0001,
   Transfer = 0x0002,
   GetAccount = 0x0003,
+  GetStats = 0x0004,  // Step 10
 
   // --- responses ---
   Pong = 0x8001,
   TransferOk = 0x8002,
   Account = 0x8003,
+  Stats = 0x8004,  // Step 10
   Error = 0x80FF,
 };
 
@@ -87,9 +89,11 @@ inline constexpr MsgTypeName kMsgTypeNames[] = {
     {MsgType::Ping, "ping"},
     {MsgType::Transfer, "transfer"},
     {MsgType::GetAccount, "get_account"},
+    {MsgType::GetStats, "get_stats"},
     {MsgType::Pong, "pong"},
     {MsgType::TransferOk, "transfer_ok"},
     {MsgType::Account, "account"},
+    {MsgType::Stats, "stats"},
     {MsgType::Error, "error"},
 };
 
@@ -146,6 +150,17 @@ struct GetAccountReq {
   }
 };
 
+/// Ask the engine how it is doing. No payload.
+///
+/// Named get_stats rather than stats so the request and its response have
+/// distinct names — the same reason get_account answers with account. Two
+/// entries sharing a name would break the reverse lookup silently, which is
+/// what ProtoNames.MsgTypeNamesRoundTrip exists to catch.
+struct GetStatsReq {
+  static constexpr MsgType kType = MsgType::GetStats;
+  static constexpr auto fields() { return std::tuple{}; }
+};
+
 // ---------------------------------------------------------------------------
 // Responses
 // ---------------------------------------------------------------------------
@@ -189,6 +204,79 @@ struct AccountResp {
   }
 };
 
+/// The engine's own vital signs.
+///
+/// Every field is an int64 for one reason: the wire has exactly five primitives
+/// (int64, string, Currency, ErrorCode, AccountStatus), and adding a sixth for
+/// the sake of one message would mean a new dispatch arm in four codec paths.
+/// Counts, depths, capacities and a millisecond duration are all naturally
+/// integers, so nothing is distorted by the choice.
+///
+/// What is deliberately *not* here: any statement about whether the ledger
+/// balances. Answering that means LedgerCore::verifyInvariants(), which takes
+/// auditMutex_ exclusively and recomputes every account from the journal. A
+/// dashboard polling once a second would freeze every transfer once a second,
+/// so the measurement would degrade the thing being measured. That number needs
+/// a rate-limited background audit, which is its own piece of work.
+///
+/// The two pools are reported separately because they *are* separate: different
+/// queues, different worker counts, different traffic. Summing them would hide
+/// the case the bounded queue exists for — one port saturated while the other
+/// is idle.
+struct StatsResp {
+  Amount uptimeMillis{0};
+  Amount accounts{0};
+
+  Amount connectionsActive{0};
+  Amount connectionsTotal{0};
+
+  Amount transfersCommitted{0};
+  Amount transfersRejected{0};
+
+  Amount binaryWorkers{0};
+  Amount binaryQueueDepth{0};
+  Amount binaryQueueCapacity{0};
+  Amount binarySubmitted{0};
+  Amount binaryCompleted{0};
+  Amount binaryRejected{0};
+  Amount binaryDropped{0};
+
+  Amount jsonWorkers{0};
+  Amount jsonQueueDepth{0};
+  Amount jsonQueueCapacity{0};
+  Amount jsonSubmitted{0};
+  Amount jsonCompleted{0};
+  Amount jsonRejected{0};
+  Amount jsonDropped{0};
+
+  static constexpr MsgType kType = MsgType::Stats;
+
+  static constexpr auto fields() {
+    return std::tuple{
+        Field{"uptime_ms", &StatsResp::uptimeMillis},
+        Field{"accounts", &StatsResp::accounts},
+        Field{"connections_active", &StatsResp::connectionsActive},
+        Field{"connections_total", &StatsResp::connectionsTotal},
+        Field{"transfers_committed", &StatsResp::transfersCommitted},
+        Field{"transfers_rejected", &StatsResp::transfersRejected},
+        Field{"binary_workers", &StatsResp::binaryWorkers},
+        Field{"binary_queue_depth", &StatsResp::binaryQueueDepth},
+        Field{"binary_queue_capacity", &StatsResp::binaryQueueCapacity},
+        Field{"binary_submitted", &StatsResp::binarySubmitted},
+        Field{"binary_completed", &StatsResp::binaryCompleted},
+        Field{"binary_rejected", &StatsResp::binaryRejected},
+        Field{"binary_dropped", &StatsResp::binaryDropped},
+        Field{"json_workers", &StatsResp::jsonWorkers},
+        Field{"json_queue_depth", &StatsResp::jsonQueueDepth},
+        Field{"json_queue_capacity", &StatsResp::jsonQueueCapacity},
+        Field{"json_submitted", &StatsResp::jsonSubmitted},
+        Field{"json_completed", &StatsResp::jsonCompleted},
+        Field{"json_rejected", &StatsResp::jsonRejected},
+        Field{"json_dropped", &StatsResp::jsonDropped},
+    };
+  }
+};
+
 /// An error response.
 ///
 /// The code is the ErrorCode from common/Result.h rather than a protocol-local
@@ -225,8 +313,8 @@ struct ErrorResp {
 //     idemKey the deduplication guarantee across connections and restarts.
 //             It goes into a UNIQUE index in the database.
 // ---------------------------------------------------------------------------
-using Request = std::variant<PingReq, TransferReq, GetAccountReq>;
-using Response = std::variant<PongResp, TransferOkResp, AccountResp, ErrorResp>;
+using Request = std::variant<PingReq, TransferReq, GetAccountReq, GetStatsReq>;
+using Response = std::variant<PongResp, TransferOkResp, AccountResp, StatsResp, ErrorResp>;
 
 struct RequestEnvelope {
   std::uint32_t reqId{0};

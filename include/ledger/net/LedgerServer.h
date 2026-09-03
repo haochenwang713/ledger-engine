@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ledger/common/ServerStats.h>
 #include <ledger/concurrent/ThreadPool.h>
 #include <ledger/core/LedgerCore.h>
 #include <ledger/net/Acceptor.h>
@@ -11,6 +12,7 @@
 #include <ledger/proto/Session.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -102,7 +104,7 @@ class ConnectionContext : public concurrent::ResponseSink,
 //   bottleneck — a request spends about 0.05 ms of parsing on the IO thread —
 //   and a second loop thread would only make debugging harder.
 // ---------------------------------------------------------------------------
-class LedgerServer {
+class LedgerServer : public ServerStatsSource {
  public:
   struct Options {
     std::uint16_t binaryPort{9000};
@@ -146,6 +148,13 @@ class LedgerServer {
   [[nodiscard]] const concurrent::ThreadPool& binaryPool() const noexcept { return binaryPool_; }
   [[nodiscard]] const concurrent::ThreadPool& jsonPool() const noexcept { return jsonPool_; }
 
+  /// Step 10 — what the get_stats message answers with.
+  ///
+  /// Called from a worker thread, concurrently with everything else. Every read
+  /// inside is an atomic load or a queue size(); nothing here takes a ledger
+  /// lock, so polling this cannot slow transfers down. See common/ServerStats.h.
+  [[nodiscard]] ServerStatsSnapshot statsSnapshot() const override;
+
  private:
   enum class Protocol : std::uint8_t { Binary, Json };
 
@@ -171,6 +180,11 @@ class LedgerServer {
   /// moment the connection is destroyed. Only the loop thread touches it, so no
   /// lock is needed.
   std::unordered_map<int, ConnectionPtr> connections_;
+
+  /// When the server was constructed, for the uptime field. steady_clock, not
+  /// system_clock: a wall-clock adjustment must not make uptime jump or go
+  /// negative.
+  std::chrono::steady_clock::time_point startedAt_{std::chrono::steady_clock::now()};
 
   /// An atomic mirror of connections_.size() for other threads to read.
   /// Reading the map's size directly is a data race, and TSan catches it —

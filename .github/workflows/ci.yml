@@ -35,6 +35,14 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+      # 端對端測試：啟動真的 ledger_engine，用 socket 從外面驗。
+      # 它跟上面那一步測的不是同一件事 —— ctest 驗每一層各自正確，
+      # 這一步驗它們接起來之後整體行為正確。
+      - name: End-to-end tests (pytest)
+        run: |
+          python3 -m pip install --quiet pytest
+          make e2e
+
       - name: Check formatting
         run: make fmt-check
 

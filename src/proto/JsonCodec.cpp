@@ -329,10 +329,19 @@ Result<RequestEnvelope> JsonCodec::decodeRequest(std::string_view frame) const {
       env.body = msg.value();
       break;
     }
+    case MsgType::GetStats: {
+      const Result<GetStatsReq> msg = decodeFieldsJson<GetStatsReq>(obj);
+      if (!msg) {
+        return msg.error();
+      }
+      env.body = msg.value();
+      break;
+    }
 
     case MsgType::Pong:
     case MsgType::TransferOk:
     case MsgType::Account:
+    case MsgType::Stats:
     case MsgType::Error:
     default:
       return ErrorCode::UnknownMessageType;
@@ -381,6 +390,14 @@ Result<ResponseEnvelope> JsonCodec::decodeResponse(std::string_view frame) const
       env.body = msg.value();
       break;
     }
+    case MsgType::Stats: {
+      const Result<StatsResp> msg = decodeFieldsJson<StatsResp>(obj);
+      if (!msg) {
+        return msg.error();
+      }
+      env.body = msg.value();
+      break;
+    }
     case MsgType::Error: {
       Result<ErrorResp> msg = decodeFieldsJson<ErrorResp>(obj);
       if (!msg) {
@@ -393,6 +410,7 @@ Result<ResponseEnvelope> JsonCodec::decodeResponse(std::string_view frame) const
     case MsgType::Ping:
     case MsgType::Transfer:
     case MsgType::GetAccount:
+    case MsgType::GetStats:
     default:
       return ErrorCode::UnknownMessageType;
   }

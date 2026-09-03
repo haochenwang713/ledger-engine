@@ -1,0 +1,4 @@
+# The end-to-end suite deliberately uses nothing but pytest and the standard
+# library. A socket and json.loads are the entire client; anything more would be
+# a dependency between the tests and the thing they are testing.
+pytest>=7.0

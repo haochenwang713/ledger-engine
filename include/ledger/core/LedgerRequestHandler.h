@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ledger/common/ServerStats.h>
 #include <ledger/concurrent/ThreadPool.h>
 #include <ledger/core/AccountRegistry.h>
 #include <ledger/core/LedgerCore.h>
@@ -38,8 +39,15 @@ namespace ledger {
 // ---------------------------------------------------------------------------
 class LedgerRequestHandler : public concurrent::RequestHandler {
  public:
-  LedgerRequestHandler(LedgerCore& core, AccountRegistry& registry) noexcept
-      : core_(core), registry_(registry) {}
+  /// `server` may be null: the ledger-only fields of a stats response still work
+  /// without it, and a handler built outside a running server (a unit test, a
+  /// future CLI) should not be forced to invent one. A null source reports zeros
+  /// for the server-side fields rather than failing the request — a monitoring
+  /// call that errors out is worse than one that admits it knows less.
+  LedgerRequestHandler(LedgerCore& core,
+                       AccountRegistry& registry,
+                       const ServerStatsSource* server = nullptr) noexcept
+      : core_(core), registry_(registry), server_(server) {}
 
   [[nodiscard]] proto::ResponseEnvelope handle(const proto::RequestEnvelope& env) override;
 
@@ -48,17 +56,19 @@ class LedgerRequestHandler : public concurrent::RequestHandler {
                                                    const proto::TransferReq& req);
   [[nodiscard]] proto::ResponseEnvelope onGetAccount(std::uint32_t reqId,
                                                      const proto::GetAccountReq& req);
+  [[nodiscard]] proto::ResponseEnvelope onGetStats(std::uint32_t reqId);
 
   LedgerCore& core_;
   AccountRegistry& registry_;
+  const ServerStatsSource* server_;
 };
 
 /// Build the factory the ThreadPool needs.
 ///
 /// The returned lambda runs once on each worker thread, so every worker gets
 /// its own handler instance.
-[[nodiscard]] concurrent::HandlerFactory makeLedgerHandlerFactory(LedgerCore& core,
-                                                                  AccountRegistry& registry);
+[[nodiscard]] concurrent::HandlerFactory makeLedgerHandlerFactory(
+    LedgerCore& core, AccountRegistry& registry, const ServerStatsSource* server = nullptr);
 
 /// Load the demo accounts.
 ///

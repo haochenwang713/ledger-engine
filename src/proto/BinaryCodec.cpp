@@ -316,11 +316,15 @@ Result<RequestEnvelope> BinaryCodec::decodeRequest(std::string_view frame) const
     case MsgType::GetAccount:
       env.body = decodeFields<GetAccountReq>(r);
       break;
+    case MsgType::GetStats:
+      env.body = decodeFields<GetStatsReq>(r);
+      break;
 
     // 回應型別出現在請求方向是協定違規，不是「不認識」。
     case MsgType::Pong:
     case MsgType::TransferOk:
     case MsgType::Account:
+    case MsgType::Stats:
     case MsgType::Error:
     default:
       return ErrorCode::UnknownMessageType;
@@ -353,6 +357,9 @@ Result<ResponseEnvelope> BinaryCodec::decodeResponse(std::string_view frame) con
     case MsgType::Account:
       env.body = decodeFields<AccountResp>(r);
       break;
+    case MsgType::Stats:
+      env.body = decodeFields<StatsResp>(r);
+      break;
     case MsgType::Error:
       env.body = decodeFields<ErrorResp>(r);
       break;
@@ -360,6 +367,7 @@ Result<ResponseEnvelope> BinaryCodec::decodeResponse(std::string_view frame) con
     case MsgType::Ping:
     case MsgType::Transfer:
     case MsgType::GetAccount:
+    case MsgType::GetStats:
     default:
       return ErrorCode::UnknownMessageType;
   }

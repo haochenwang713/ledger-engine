@@ -37,7 +37,7 @@ else
   export PGPASSWORD ?= ledger_dev_password
 endif
 
-.PHONY: help up down shell configure build test run clean rebuild tsan asan \
+.PHONY: help up down shell configure build test e2e run clean rebuild tsan asan \
         fmt fmt-check psql db-reset db-seed db-check db-test db-status db-all \
         db-native-setup doctor
 
@@ -61,7 +61,8 @@ help:
 	@echo ""
 	@echo "建置（在 Linux 或容器內執行）"
 	@echo "  make build       configure + 編譯"
-	@echo "  make test        編譯並跑 ctest"
+	@echo "  make test        編譯並跑 ctest（C++ 單元與整合測試）"
+	@echo "  make e2e         用 pytest 從外部驅動真的伺服器跑端對端測試"
 	@echo "  make run         執行 ledger_engine"
 	@echo "  make clean       刪除 build 目錄"
 	@echo "  make rebuild     clean + build"
@@ -185,6 +186,16 @@ build: configure
 
 test: build
 	cd $(BUILD_DIR) && ctest --output-on-failure
+
+# 端對端測試：用 pytest 從外部驅動真的 ledger_engine。
+#
+# 它跟 ctest 測的不是同一件事。ctest 從內部呼叫 C++ 函式；這裡只有
+# socket 與 JSON，看到的東西跟瀏覽器、壓測腳本、或一個打 nc 的人一模一樣。
+# Stage 6 把記憶體換成 PostgreSQL 之後，這一組測試應該一行都不用改。
+#
+# 需要 Linux（伺服器要 epoll）。在 Mac 上先 make shell 進容器。
+e2e: build
+	cd tests/e2e && python3 -m pytest
 
 run: build
 	./$(BUILD_DIR)/src/ledger_engine

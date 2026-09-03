@@ -3,6 +3,9 @@
 //
 // 這裡測的是「規則對不對」：拒絕該拒絕的、接受該接受的、數字算得對。
 // 併發正確性是另一個檔案（test_concurrency.cpp）的事。
+//
+// Test structure: Arrange-Act-Assert. The shared Arrange lives in the fixture's
+// SetUp(); each test adds only what it needs on top. See instruction.md.
 // ---------------------------------------------------------------------------
 
 #include <ledger/core/AccountRegistry.h>
@@ -10,6 +13,11 @@
 #include <ledger/core/LedgerCore.h>
 
 #include <gtest/gtest.h>
+
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
 
 namespace ledger {
 namespace {
@@ -22,6 +30,7 @@ constexpr AccountId kCarolJpy = 3003;
 
 class LedgerCoreTest : public ::testing::Test {
  protected:
+  // Arrange（共用）—— 每條測試都從這三個帳戶開始。
   void SetUp() override {
     core_ = std::make_unique<LedgerCore>(registry_, journal_);
 
@@ -44,8 +53,10 @@ class LedgerCoreTest : public ::testing::Test {
 // === 正常路徑 ==============================================================
 
 TEST_F(LedgerCoreTest, TransfersMoneyAndReportsNewBalances) {
+  // Act
   const auto result = core_->transfer(usdTransfer(kAlice, kBob, 5000, "req-a3f9-01"));
 
+  // Assert
   ASSERT_TRUE(result.ok()) << toString(result.error());
   EXPECT_EQ(result.value().fromBalance, 115000);  // 1,200.00 - 50.00
   EXPECT_EQ(result.value().toBalance, 47000);     //   420.00 + 50.00
@@ -55,8 +66,10 @@ TEST_F(LedgerCoreTest, TransfersMoneyAndReportsNewBalances) {
 }
 
 TEST_F(LedgerCoreTest, WritesExactlyTwoBalancedEntries) {
+  // Act
   ASSERT_TRUE(core_->transfer(usdTransfer(kAlice, kBob, 5000)).ok());
 
+  // Assert
   EXPECT_EQ(journal_.transactionCount(), 1u);
   EXPECT_EQ(journal_.entryCount(), 2u);
 
@@ -75,8 +88,11 @@ TEST_F(LedgerCoreTest, WritesExactlyTwoBalancedEntries) {
 }
 
 TEST_F(LedgerCoreTest, AllowsSpendingTheEntireBalance) {
-  // 邊界：剛好把錢花光應該成功，不能因為「>=」寫成「>」而被擋
-  ASSERT_TRUE(core_->transfer(usdTransfer(kAlice, kBob, 120000)).ok());
+  // Act —— 邊界：剛好把錢花光
+  const auto result = core_->transfer(usdTransfer(kAlice, kBob, 120000));
+
+  // Assert —— 應該成功，不能因為「>=」寫成「>」而被擋
+  ASSERT_TRUE(result.ok());
   EXPECT_EQ(balanceOf(kAlice), 0);
 }
 
@@ -84,8 +100,10 @@ TEST_F(LedgerCoreTest, AllowsSpendingTheEntireBalance) {
 
 // ★ 這一條就是防 double-spending
 TEST_F(LedgerCoreTest, RejectsOverdraft) {
+  // Act
   const auto result = core_->transfer(usdTransfer(kAlice, kBob, 120001));
 
+  // Assert
   EXPECT_FALSE(result.ok());
   EXPECT_EQ(result.error(), ErrorCode::InsufficientFunds);
 
@@ -97,53 +115,84 @@ TEST_F(LedgerCoreTest, RejectsOverdraft) {
 
 // ★ 這一條若沒擋，執行緒會對同一把 mutex 鎖兩次而卡死自己
 TEST_F(LedgerCoreTest, RejectsSelfTransferBeforeTakingLocks) {
+  // Act
   const auto result = core_->transfer(usdTransfer(kAlice, kAlice, 100));
+
+  // Assert
   EXPECT_EQ(result.error(), ErrorCode::SelfTransfer);
   EXPECT_EQ(balanceOf(kAlice), 120000);
 }
 
 TEST_F(LedgerCoreTest, RejectsCrossCurrencyTransfer) {
-  // USD 帳戶轉給 JPY 帳戶 —— 對應 Stage 2 schema 的複合外鍵所擋下的情況
-  TransferRequest req{"k", kAlice, kCarolJpy, 5000, Currency::USD};
-  EXPECT_EQ(core_->transfer(req).error(), ErrorCode::CurrencyMismatch);
+  // Arrange —— USD 帳戶轉給 JPY 帳戶，
+  // 對應 Stage 2 schema 的複合外鍵所擋下的情況。
+  const TransferRequest req{"k", kAlice, kCarolJpy, 5000, Currency::USD};
+
+  // Act
+  const auto result = core_->transfer(req);
+
+  // Assert
+  EXPECT_EQ(result.error(), ErrorCode::CurrencyMismatch);
 }
 
 TEST_F(LedgerCoreTest, RejectsRequestWhoseCurrencyDisagreesWithAccounts) {
-  // 兩腳都是 USD 帳戶，但請求標成 JPY
-  TransferRequest req{"k", kAlice, kBob, 5000, Currency::JPY};
-  EXPECT_EQ(core_->transfer(req).error(), ErrorCode::CurrencyMismatch);
+  // Arrange —— 兩腳都是 USD 帳戶，但請求標成 JPY
+  const TransferRequest req{"k", kAlice, kBob, 5000, Currency::JPY};
+
+  // Act
+  const auto result = core_->transfer(req);
+
+  // Assert
+  EXPECT_EQ(result.error(), ErrorCode::CurrencyMismatch);
 }
 
 TEST_F(LedgerCoreTest, RejectsNonPositiveAmounts) {
-  EXPECT_EQ(core_->transfer(usdTransfer(kAlice, kBob, 0)).error(), ErrorCode::InvalidAmount);
-  EXPECT_EQ(core_->transfer(usdTransfer(kAlice, kBob, -100)).error(), ErrorCode::InvalidAmount);
+  // Act
+  const auto zero = core_->transfer(usdTransfer(kAlice, kBob, 0));
+  const auto negative = core_->transfer(usdTransfer(kAlice, kBob, -100));
+
+  // Assert
+  EXPECT_EQ(zero.error(), ErrorCode::InvalidAmount);
+  EXPECT_EQ(negative.error(), ErrorCode::InvalidAmount);
 }
 
 TEST_F(LedgerCoreTest, RejectsUnknownAccounts) {
-  EXPECT_EQ(core_->transfer(usdTransfer(kAlice, 999999, 100)).error(), ErrorCode::AccountNotFound);
-  EXPECT_EQ(core_->transfer(usdTransfer(999999, kBob, 100)).error(), ErrorCode::AccountNotFound);
+  // Act
+  const auto badDestination = core_->transfer(usdTransfer(kAlice, 999999, 100));
+  const auto badSource = core_->transfer(usdTransfer(999999, kBob, 100));
+
+  // Assert
+  EXPECT_EQ(badDestination.error(), ErrorCode::AccountNotFound);
+  EXPECT_EQ(badSource.error(), ErrorCode::AccountNotFound);
 }
 
 TEST_F(LedgerCoreTest, RejectsOverflowInsteadOfWrapping) {
-  // 系統帳戶允許負餘額，所以可以轉出天文數字而不觸發 InsufficientFunds
-  // —— 這樣才測得到溢位那條路徑。
+  // Arrange —— 系統帳戶允許負餘額，所以可以轉出天文數字而不觸發
+  // InsufficientFunds；這樣才測得到溢位那條路徑。
   ASSERT_TRUE(registry_.createWithId(1, 0, Currency::USD, 0, /*allowNegative=*/true).ok());
   ASSERT_TRUE(
       registry_.createWithId(2, 999, Currency::USD, std::numeric_limits<Amount>::max() - 10).ok());
+  const TransferRequest req{"k", 1, 2, 1000, Currency::USD};
 
-  TransferRequest req{"k", 1, 2, 1000, Currency::USD};
-  EXPECT_EQ(core_->transfer(req).error(), ErrorCode::AmountOverflow);
+  // Act
+  const auto result = core_->transfer(req);
+
+  // Assert
+  EXPECT_EQ(result.error(), ErrorCode::AmountOverflow);
 }
 
 // === 系統帳戶 ==============================================================
 
 TEST_F(LedgerCoreTest, SystemAccountsMayGoNegative) {
+  // Arrange
   ASSERT_TRUE(registry_.createWithId(1, 0, Currency::USD, 0, /*allowNegative=*/true).ok());
-
   // 錢從系統帳戶流入使用者帳戶。這是資金進入系統的唯一合法方式。
-  TransferRequest req{"seed", 1, kAlice, 999999, Currency::USD};
+  const TransferRequest req{"seed", 1, kAlice, 999999, Currency::USD};
+
+  // Act
   ASSERT_TRUE(core_->transfer(req).ok());
 
+  // Assert
   EXPECT_EQ(balanceOf(1), -999999);                               // 系統帳戶負了
   EXPECT_EQ(balanceOf(kAlice), 1119999);                          // 使用者收到了
   EXPECT_EQ(core_->totalBalance(Currency::USD), 120000 + 42000);  // 總量沒變 ★
@@ -152,23 +201,27 @@ TEST_F(LedgerCoreTest, SystemAccountsMayGoNegative) {
 // === Registry ==============================================================
 
 TEST_F(LedgerCoreTest, RegistryEnforcesOneAccountPerOwnerAndCurrency) {
-  // Alice 已經有 USD 帳戶了
-  EXPECT_EQ(registry_.create(101, Currency::USD).error(), ErrorCode::DuplicateAccount);
-  // 但可以有 TWD 帳戶
-  EXPECT_TRUE(registry_.create(101, Currency::TWD).ok());
+  // Act —— Alice 已經有 USD 帳戶了
+  const auto duplicate = registry_.create(101, Currency::USD);
+  const auto differentCurrency = registry_.create(101, Currency::TWD);
+
+  // Assert
+  EXPECT_EQ(duplicate.error(), ErrorCode::DuplicateAccount);
+  EXPECT_TRUE(differentCurrency.ok());  // 但可以有 TWD 帳戶
 }
 
 TEST_F(LedgerCoreTest, AccountPointersStayValidAcrossManyInsertions) {
-  // AccountRegistry 的核心前提：Account* 一旦取得就永遠有效，
+  // Arrange —— AccountRegistry 的核心前提：Account* 一旦取得就永遠有效，
   // 即使 unordered_map 因為插入而 rehash。
   Account* alice = registry_.find(kAlice);
   ASSERT_NE(alice, nullptr);
 
+  // Act
   for (OwnerId i = 0; i < 2000; ++i) {
     ASSERT_TRUE(registry_.create(10000 + i, Currency::EUR).ok());
   }
 
-  // 若 Account 不是存在 unique_ptr 裡，這裡就是 use-after-free
+  // Assert —— 若 Account 不是存在 unique_ptr 裡，這裡就是 use-after-free
   EXPECT_EQ(alice->id(), kAlice);
   EXPECT_EQ(alice->balance(), 120000);
   EXPECT_EQ(registry_.find(kAlice), alice);  // 位址沒變
@@ -177,6 +230,7 @@ TEST_F(LedgerCoreTest, AccountPointersStayValidAcrossManyInsertions) {
 // === 不變式 ================================================================
 
 TEST_F(LedgerCoreTest, InvariantsHoldAfterManyTransfers) {
+  // Act —— 來回轉 200 次
   for (int i = 0; i < 200; ++i) {
     const bool forward = (i % 2 == 0);
     const auto req = forward ? usdTransfer(kAlice, kBob, 100, "k" + std::to_string(i))
@@ -184,6 +238,7 @@ TEST_F(LedgerCoreTest, InvariantsHoldAfterManyTransfers) {
     ASSERT_TRUE(core_->transfer(req).ok());
   }
 
+  // Assert
   EXPECT_TRUE(journal_.allTransactionsBalanced());                // I1
   EXPECT_TRUE(core_->verifyInvariants());                         // I1 + I2
   EXPECT_EQ(core_->totalBalance(Currency::USD), 120000 + 42000);  // I3
@@ -192,10 +247,12 @@ TEST_F(LedgerCoreTest, InvariantsHoldAfterManyTransfers) {
 }
 
 TEST_F(LedgerCoreTest, RejectedTransfersLeaveNoTrace) {
+  // Act —— 三種不同的失敗原因
   ASSERT_FALSE(core_->transfer(usdTransfer(kAlice, kBob, 999999999)).ok());
   ASSERT_FALSE(core_->transfer(usdTransfer(kAlice, kAlice, 100)).ok());
   ASSERT_FALSE(core_->transfer(usdTransfer(kAlice, 424242, 100)).ok());
 
+  // Assert
   EXPECT_EQ(journal_.transactionCount(), 0u);
   EXPECT_EQ(core_->transferCount(), 0u);
   EXPECT_EQ(core_->rejectedCount(), 3u);

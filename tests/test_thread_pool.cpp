@@ -8,6 +8,10 @@
 //
 // 所以下面每一條「不該卡住」的測試都帶明確的時間上界。逾時就是失敗，
 // 而不是讓 ctest 掛在那裡等三十分鐘。
+//
+// Test structure: Arrange-Act-Assert. In the timing tests the Act phase is
+// wrapped in millisFor(), so "how long the action took" is itself one of the
+// assertions. See instruction.md for the convention.
 // ---------------------------------------------------------------------------
 
 #include <ledger/concurrent/BlockingQueue.h>
@@ -129,12 +133,16 @@ Task makeTask(const ResponseSinkPtr& sink, std::uint32_t reqId) {
 // ===========================================================================
 
 TEST(BlockingQueue, PushPopPreservesOrder) {
+  // Arrange
   BlockingQueue<int> q{16};
+
+  // Act
   for (int i = 0; i < 5; ++i) {
     EXPECT_TRUE(q.tryPush(i));
   }
-  EXPECT_EQ(q.size(), 5U);
 
+  // Assert
+  EXPECT_EQ(q.size(), 5U);
   for (int i = 0; i < 5; ++i) {
     const auto v = q.tryPop();
     ASSERT_TRUE(v.has_value());
@@ -146,7 +154,10 @@ TEST(BlockingQueue, PushPopPreservesOrder) {
 }
 
 TEST(BlockingQueue, CapacityIsEnforced) {
+  // Arrange
   BlockingQueue<int> q{3};
+
+  // Act & Assert —— 第四筆必須被拒絕。
   EXPECT_TRUE(q.tryPush(1));
   EXPECT_TRUE(q.tryPush(2));
   EXPECT_TRUE(q.tryPush(3));
@@ -160,23 +171,28 @@ TEST(BlockingQueue, CapacityIsEnforced) {
 //   IO 執行緒在佇列滿時若阻塞，整個 event loop 停擺 —— 所有連線一起死。
 //   所以 tryPush 必須「立刻」回 false，不是「很快」回 false。
 TEST(BlockingQueue, TryPushNeverBlocksWhenFull) {
+  // Arrange —— 容量 1，先塞滿。
   BlockingQueue<int> q{1};
   EXPECT_TRUE(q.tryPush(1));
 
+  // Act
   const auto elapsed = millisFor([&] {
     for (int i = 0; i < 10000; ++i) {
       EXPECT_FALSE(q.tryPush(i));
     }
   });
 
-  // 一萬次被拒絕的推入應該是微秒等級的事。給 500ms 的寬鬆上界，
+  // Assert —— 一萬次被拒絕的推入應該是微秒等級的事。給 500ms 的寬鬆上界，
   // 任何形式的阻塞都會遠遠超過它。
   EXPECT_TRUE(elapsed < 500) << "tryPush 疑似阻塞了，耗時 " << elapsed << " ms";
   EXPECT_EQ(q.totalRejected(), 10000U);
 }
 
 TEST(BlockingQueue, TryPopOnEmptyReturnsNullopt) {
+  // Arrange
   BlockingQueue<int> q{4};
+
+  // Act & Assert
   EXPECT_FALSE(q.tryPop().has_value());
 }
 
@@ -185,6 +201,7 @@ TEST(BlockingQueue, TryPopOnEmptyReturnsNullopt) {
 // ===========================================================================
 
 TEST(BlockingQueue, PopBlocksUntilItemArrives) {
+  // Arrange
   BlockingQueue<int> q{4};
   std::latch consumerReady{1};
   std::optional<int> got;
@@ -196,14 +213,18 @@ TEST(BlockingQueue, PopBlocksUntilItemArrives) {
 
   consumerReady.wait();
   std::this_thread::sleep_for(50ms);  // 確保 consumer 真的睡在 pop 上
-  EXPECT_TRUE(q.tryPush(99));
 
+  // Act
+  EXPECT_TRUE(q.tryPush(99));
   consumer.join();
+
+  // Assert
   ASSERT_TRUE(got.has_value());
   EXPECT_EQ(*got, 99);
 }
 
 TEST(BlockingQueue, PushBlocksUntilSpaceAppears) {
+  // Arrange —— 容量 1，先塞滿，再讓另一條執行緒卡在 push 上。
   BlockingQueue<int> q{1};
   EXPECT_TRUE(q.tryPush(1));
 
@@ -219,8 +240,11 @@ TEST(BlockingQueue, PushBlocksUntilSpaceAppears) {
   std::this_thread::sleep_for(50ms);
   EXPECT_EQ(q.size(), 1U);  // 還沒進去
 
-  EXPECT_TRUE(q.tryPop().has_value());  // 騰出空位
+  // Act —— 騰出空位
+  EXPECT_TRUE(q.tryPop().has_value());
   producer.join();
+
+  // Assert
   EXPECT_TRUE(pushed);
 }
 
@@ -230,6 +254,7 @@ TEST(BlockingQueue, PushBlocksUntilSpaceAppears) {
 //   其餘的永遠睡著 —— join() 就永遠回不來。這種 bug 表現為「程式關不掉」，
 //   不會有任何錯誤訊息，而且只在關機路徑出現。
 TEST(BlockingQueue, CloseWakesEveryBlockedConsumer) {
+  // Arrange —— 八條執行緒全部睡在 pop() 上。
   constexpr int kConsumers = 8;
   BlockingQueue<int> q{16};
 
@@ -250,6 +275,7 @@ TEST(BlockingQueue, CloseWakesEveryBlockedConsumer) {
   allBlocked.wait();
   std::this_thread::sleep_for(50ms);  // 讓它們確實睡進 pop
 
+  // Act
   const auto elapsed = millisFor([&] {
     q.close();
     for (auto& c : consumers) {
@@ -257,11 +283,13 @@ TEST(BlockingQueue, CloseWakesEveryBlockedConsumer) {
     }
   });
 
+  // Assert —— 八條全部醒來，而且很快。
   EXPECT_EQ(woke.load(), kConsumers);
   EXPECT_TRUE(elapsed < 2000) << "close() 之後 join 花了 " << elapsed << " ms，疑似漏了 notify_all";
 }
 
 TEST(BlockingQueue, CloseWakesBlockedProducer) {
+  // Arrange
   BlockingQueue<int> q{1};
   EXPECT_TRUE(q.tryPush(1));
 
@@ -276,11 +304,13 @@ TEST(BlockingQueue, CloseWakesBlockedProducer) {
   ready.wait();
   std::this_thread::sleep_for(50ms);
 
+  // Act
   const auto elapsed = millisFor([&] {
     q.close();
     producer.join();
   });
 
+  // Assert
   EXPECT_FALSE(result) << "佇列關閉後 push() 應該回 false";
   EXPECT_TRUE(elapsed < 2000) << "close() 沒有喚醒阻塞中的 push()";
 }
@@ -290,12 +320,16 @@ TEST(BlockingQueue, CloseWakesBlockedProducer) {
 //   那些是「已收下、client 正在等回應」的請求。直接丟掉的話，
 //   那些 client 只能等自己 timeout。
 TEST(BlockingQueue, CloseStillDrainsRemainingItems) {
+  // Arrange
   BlockingQueue<int> q{16};
   for (int i = 0; i < 5; ++i) {
     EXPECT_TRUE(q.tryPush(i));
   }
 
+  // Act
   q.close();
+
+  // Assert
   EXPECT_TRUE(q.closed());
   EXPECT_FALSE(q.tryPush(99));  // 不再收新的
 
@@ -309,20 +343,23 @@ TEST(BlockingQueue, CloseStillDrainsRemainingItems) {
 
 // ★ stop_token 與 close() 的差別：前者不排空。
 TEST(BlockingQueue, StopTokenAbandonsRemainingItems) {
+  // Arrange
   BlockingQueue<int> q{16};
   for (int i = 0; i < 5; ++i) {
     EXPECT_TRUE(q.tryPush(i));
   }
-
   std::stop_source source;
+
+  // Act
   source.request_stop();
 
-  // 即使佇列裡還有五個元素，已被請求停止就不再拿新工作。
+  // Assert —— 即使佇列裡還有五個元素，已被請求停止就不再拿新工作。
   EXPECT_FALSE(q.pop(source.get_token()).has_value());
   EXPECT_EQ(q.size(), 5U) << "元素應該還留在佇列裡，只是不再被取用";
 }
 
 TEST(BlockingQueue, StopTokenWakesBlockedConsumer) {
+  // Arrange
   BlockingQueue<int> q{4};
   std::stop_source source;
   std::latch ready{1};
@@ -336,17 +373,20 @@ TEST(BlockingQueue, StopTokenWakesBlockedConsumer) {
   ready.wait();
   std::this_thread::sleep_for(50ms);
 
+  // Act
   const auto elapsed = millisFor([&] {
     source.request_stop();
     consumer.join();
   });
 
+  // Assert
   EXPECT_TRUE(gotNullopt);
   EXPECT_TRUE(elapsed < 2000) << "request_stop() 沒有喚醒阻塞中的 pop()";
 }
 
 // ★ TSan 的主戰場：多生產者、多消費者、每個元素恰好被拿走一次。
 TEST(BlockingQueue, MpmcDeliversEveryItemExactlyOnce) {
+  // Arrange
   constexpr int kProducers = 4;
   constexpr int kConsumers = 4;
   constexpr int kPerProducer = 5000;
@@ -356,6 +396,7 @@ TEST(BlockingQueue, MpmcDeliversEveryItemExactlyOnce) {
   std::vector<std::vector<int>> received(kConsumers);
   std::atomic<int> consumed{0};
 
+  // Act —— 四個生產者、四個消費者，全部跑完再收工。
   std::vector<std::jthread> consumers;
   for (int c = 0; c < kConsumers; ++c) {
     consumers.emplace_back([&, c] {
@@ -388,6 +429,7 @@ TEST(BlockingQueue, MpmcDeliversEveryItemExactlyOnce) {
     c.join();
   }
 
+  // Assert
   EXPECT_EQ(consumed.load(), kTotal);
   EXPECT_EQ(q.totalPushed(), static_cast<std::uint64_t>(kTotal));
   EXPECT_EQ(q.totalPopped(), static_cast<std::uint64_t>(kTotal));
@@ -407,10 +449,12 @@ TEST(BlockingQueue, MpmcDeliversEveryItemExactlyOnce) {
 // ===========================================================================
 
 TEST(ThreadPool, ProcessesEverySubmittedTask) {
+  // Arrange
   constexpr int kTasks = 500;
   std::atomic<int> calls{0};
   auto sink = std::make_shared<RecordingSink>();
 
+  // Act
   {
     ThreadPool pool{"test", 4, 1024, pongFactory(&calls)};
     for (int i = 0; i < kTasks; ++i) {
@@ -419,6 +463,7 @@ TEST(ThreadPool, ProcessesEverySubmittedTask) {
     pool.shutdown();  // 排空
   }
 
+  // Assert
   EXPECT_EQ(calls.load(), kTasks);
   EXPECT_EQ(sink->count(), static_cast<std::size_t>(kTasks));
 
@@ -434,11 +479,14 @@ TEST(ThreadPool, ProcessesEverySubmittedTask) {
 TEST(ThreadPool, EachWorkerGetsItsOwnHandler) {
   // ★ Stage 6 的前提：每個 worker 一條 DB 連線。
   //   工廠必須恰好被呼叫 workerCount 次，而且 index 各不相同。
+
+  // Arrange
   constexpr std::size_t kWorkers = 6;
   std::mutex mutex;
   std::set<std::size_t> indices;
   std::atomic<int> factoryCalls{0};
 
+  // Act —— 光是建立 pool 就會呼叫工廠。
   {
     ThreadPool pool{
         "test", kWorkers, 64, [&](std::size_t index) -> std::unique_ptr<RequestHandler> {
@@ -452,6 +500,7 @@ TEST(ThreadPool, EachWorkerGetsItsOwnHandler) {
     pool.shutdown();
   }
 
+  // Assert
   EXPECT_EQ(factoryCalls.load(), static_cast<int>(kWorkers));
   EXPECT_EQ(indices.size(), kWorkers);
   EXPECT_TRUE(indices.count(0) == 1);
@@ -459,14 +508,15 @@ TEST(ThreadPool, EachWorkerGetsItsOwnHandler) {
 }
 
 TEST(ThreadPool, SubmitRejectsWhenQueueIsFull) {
-  // 一條 worker、每筆睡 50ms、佇列只有 4 格 —— 一定塞得爆。
+  // Arrange —— 一條 worker、每筆睡 50ms、佇列只有 4 格，一定塞得爆。
   auto sink = std::make_shared<RecordingSink>();
   ThreadPool pool{"test", 1, 4, [](std::size_t) -> std::unique_ptr<RequestHandler> {
                     return std::make_unique<SlowHandler>(50ms);
                   }};
-
   int accepted = 0;
   int refused = 0;
+
+  // Act
   const auto elapsed = millisFor([&] {
     for (int i = 0; i < 200; ++i) {
       if (pool.submit(makeTask(sink, static_cast<std::uint32_t>(i)))) {
@@ -477,7 +527,7 @@ TEST(ThreadPool, SubmitRejectsWhenQueueIsFull) {
     }
   });
 
-  // 重點不是拒絕了幾筆，而是「提交 200 次沒有卡住」。
+  // Assert —— 重點不是拒絕了幾筆，而是「提交 200 次沒有卡住」。
   // 200 筆若全被接受並處理完要 10 秒；submit 若會阻塞就會接近那個數字。
   EXPECT_TRUE(refused > 0) << "佇列應該要滿才對";
   EXPECT_TRUE(elapsed < 1000) << "submit 疑似阻塞了，耗時 " << elapsed << " ms";
@@ -487,18 +537,19 @@ TEST(ThreadPool, SubmitRejectsWhenQueueIsFull) {
 }
 
 TEST(ThreadPool, ShutdownDrainsPendingTasks) {
+  // Arrange
   constexpr int kTasks = 40;
   std::atomic<int> calls{0};
   auto sink = std::make_shared<RecordingSink>();
-
   ThreadPool pool{"test", 2, 256, pongFactory(&calls)};
   for (int i = 0; i < kTasks; ++i) {
     EXPECT_TRUE(pool.submit(makeTask(sink, static_cast<std::uint32_t>(i))));
   }
 
+  // Act
   pool.shutdown();
 
-  // shutdown() 回來時，佇列裡的每一筆都必須已經處理完 ——
+  // Assert —— shutdown() 回來時，佇列裡的每一筆都必須已經處理完 ——
   // 它們是「client 還在等回應」的工作。
   EXPECT_EQ(calls.load(), kTasks);
   EXPECT_EQ(pool.completed(), static_cast<std::uint64_t>(kTasks));
@@ -506,43 +557,44 @@ TEST(ThreadPool, ShutdownDrainsPendingTasks) {
 }
 
 TEST(ThreadPool, AbortDoesNotWaitForPendingTasks) {
-  // 一條 worker、每筆 100ms、丟 50 筆進去 —— 全做完要 5 秒。
-  // abort() 必須遠快於此。
+  // Arrange —— 一條 worker、每筆 100ms、丟 50 筆進去，全做完要 5 秒。
   auto sink = std::make_shared<RecordingSink>();
   ThreadPool pool{"test", 1, 256, [](std::size_t) -> std::unique_ptr<RequestHandler> {
                     return std::make_unique<SlowHandler>(100ms);
                   }};
-
   for (int i = 0; i < 50; ++i) {
     EXPECT_TRUE(pool.submit(makeTask(sink, static_cast<std::uint32_t>(i))));
   }
   std::this_thread::sleep_for(50ms);
 
+  // Act
   const auto elapsed = millisFor([&] { pool.abort(); });
 
+  // Assert —— abort() 必須遠快於 5 秒。
   EXPECT_TRUE(elapsed < 2000) << "abort() 花了 " << elapsed << " ms，它不該等佇列排空";
   EXPECT_TRUE(pool.completed() < 50U) << "abort() 不應該把全部做完";
 }
 
 // ★ W2 不變式：worker 做完時連線可能已經不在。
 TEST(ThreadPool, DiscardsResultWhenSinkIsGone) {
+  // Arrange
   ThreadPool pool{"test", 1, 64, [](std::size_t) -> std::unique_ptr<RequestHandler> {
                     return std::make_unique<SlowHandler>(150ms);
                   }};
-
   auto liveSink = std::make_shared<RecordingSink>();
   auto doomedSink = std::make_shared<RecordingSink>();
 
   // 第一筆會占住那條唯一的 worker 150ms。
   EXPECT_TRUE(pool.submit(makeTask(liveSink, 1)));
-  // 第二筆在佇列裡等；趁它還沒被處理，把它的 sink 銷毀。
+  // 第二筆在佇列裡等。
   EXPECT_TRUE(pool.submit(makeTask(doomedSink, 2)));
-
   std::this_thread::sleep_for(20ms);
-  doomedSink.reset();  // 模擬 client 斷線
 
+  // Act —— 趁第二筆還沒被處理，把它的 sink 銷毀（模擬 client 斷線）。
+  doomedSink.reset();
   pool.shutdown();
 
+  // Assert
   EXPECT_EQ(pool.droppedNoSink(), 1U) << "sink 已失效的工作應該被丟棄";
   EXPECT_EQ(liveSink->count(), 1U);
 }
@@ -550,13 +602,15 @@ TEST(ThreadPool, DiscardsResultWhenSinkIsGone) {
 TEST(ThreadPool, ConcurrentSubmitFromManyThreads) {
   // IO 執行緒實際上只有一條，但這條測試確保 submit 本身是執行緒安全的，
   // 也讓 TSan 有機會在 submit 路徑上找 race。
+
+  // Arrange
   constexpr int kThreads = 8;
   constexpr int kPerThread = 500;
-
   std::atomic<int> calls{0};
   auto sink = std::make_shared<RecordingSink>();
   ThreadPool pool{"test", 4, 8192, pongFactory(&calls)};
 
+  // Act
   {
     std::vector<std::jthread> submitters;
     for (int t = 0; t < kThreads; ++t) {
@@ -572,6 +626,8 @@ TEST(ThreadPool, ConcurrentSubmitFromManyThreads) {
   }  // jthread 解構會 join
 
   pool.shutdown();
+
+  // Assert
   EXPECT_EQ(calls.load(), kThreads * kPerThread);
   EXPECT_EQ(pool.completed(), static_cast<std::uint64_t>(kThreads * kPerThread));
 }
@@ -579,16 +635,20 @@ TEST(ThreadPool, ConcurrentSubmitFromManyThreads) {
 TEST(ThreadPool, MeasuresQueueWaitTime) {
   // 排隊時間與處理時間是兩回事。過載時前者才是延遲主因，
   // 分開量才不會把「排隊很久」誤診成「處理很慢」。
+
+  // Arrange
   auto sink = std::make_shared<RecordingSink>();
   ThreadPool pool{"test", 1, 64, [](std::size_t) -> std::unique_ptr<RequestHandler> {
                     return std::make_unique<SlowHandler>(30ms);
                   }};
 
+  // Act
   for (int i = 0; i < 5; ++i) {
     EXPECT_TRUE(pool.submit(makeTask(sink, static_cast<std::uint32_t>(i))));
   }
   pool.shutdown();
 
+  // Assert
   EXPECT_EQ(pool.completed(), 5U);
   // 第 5 筆得等前面四筆各 30ms，所以累計排隊時間必然大於零。
   EXPECT_TRUE(pool.totalQueueWaitMicros() > 0U);
@@ -596,9 +656,12 @@ TEST(ThreadPool, MeasuresQueueWaitTime) {
 
 TEST(ThreadPool, DestructorShutsDownCleanly) {
   // 沒有明確呼叫 shutdown()，解構子也必須把事情收乾淨且不 hang。
+
+  // Arrange
   std::atomic<int> calls{0};
   auto sink = std::make_shared<RecordingSink>();
 
+  // Act
   const auto elapsed = millisFor([&] {
     ThreadPool pool{"test", 4, 256, pongFactory(&calls)};
     for (int i = 0; i < 100; ++i) {
@@ -606,25 +669,34 @@ TEST(ThreadPool, DestructorShutsDownCleanly) {
     }
   });  // ← 解構子在這裡執行
 
+  // Assert
   EXPECT_TRUE(elapsed < 3000) << "解構子花了 " << elapsed << " ms，疑似 hang 住";
   EXPECT_EQ(calls.load(), 100) << "解構子應該走優雅關機（排空）";
 }
 
 TEST(ThreadPool, ShutdownIsIdempotent) {
+  // Arrange
   std::atomic<int> calls{0};
   ThreadPool pool{"test", 2, 64, pongFactory(&calls)};
+
+  // Act
   pool.shutdown();
   pool.shutdown();  // 第二次不該爆炸也不該卡住
   pool.abort();     // 已經關了，也不該爆炸
+
+  // Assert
   EXPECT_EQ(pool.completed(), 0U);
 }
 
 TEST(ThreadPool, CodecTagSurvivesRoundTrip) {
   // Task 帶著 CodecTag 跑完整趟，回程時 sink 才知道要用哪種編碼。
   // 少了它，worker 就得知道自己在服務哪個 port —— 那是不該有的耦合。
+
+  // Arrange
   auto sink = std::make_shared<RecordingSink>();
   std::atomic<int> calls{0};
 
+  // Act —— 用 Json tag 送一筆進去。
   {
     ThreadPool pool{"test", 1, 16, pongFactory(&calls)};
     Task task{sink, proto::RequestEnvelope{7, proto::PingReq{}}, proto::CodecTag::Json};
@@ -632,6 +704,7 @@ TEST(ThreadPool, CodecTagSurvivesRoundTrip) {
     pool.shutdown();
   }
 
+  // Assert
   EXPECT_EQ(sink->count(), 1U);
   EXPECT_EQ(sink->lastCodec(), proto::CodecTag::Json);
 }

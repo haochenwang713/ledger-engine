@@ -34,6 +34,7 @@ Steps [0](#step-0--architecture-and-the-decisions-that-constrain-everything-else
 [B: how correctness was verified](#appendix-b--how-correctness-was-verified) ·
 [C: decisions](#appendix-c--decisions-worth-remembering) ·
 [D: protocol reference](#appendix-d--protocol-reference) ·
+[E: the test suites](#appendix-e--the-test-suites) ·
 [**where we are right now**](#where-we-are-right-now)
 
 ---
@@ -57,16 +58,24 @@ engine watchable instead of only testable.
 | 7 | Sanitizer and stress verification of the DB-backed path | ⬜ Not started |
 | 8 | Load tests, tuning, TPS and p95 numbers | ⬜ Not started |
 | 9 | Final architecture docs and diagrams | ⬜ Not started |
-| **10** | **Observability surface — the engine reports on itself** | ⬜ **Next** |
-| **11** | **Gateway — WebSocket/HTTP bridge so a browser can talk to it** | ⬜ Next |
-| **12** | **Web console — see accounts, transfers, and concurrency live** | ⬜ Next |
+| **10a** | **Observability — `get_stats`, the engine reports on itself** | ✅ **Done** |
+| **10b** | **Observability — a pushed event stream** | ⬜ **Next** |
+| **11** | **Gateway — WebSocket/HTTP bridge so a browser can talk to it** | ⬜ |
+| **12** | **Web console — see accounts, transfers, and concurrency live** | ⬜ |
 
 **Execution order is not step order.** The numbers above are the canonical stage
 ids. The order of work from here is:
 
 ```
-10 → 11 → 12 → 6 → 7 → 8 → 9
+10a → 10b → 11 → 12 → 6 → 7 → 8 → 9
+      ↑ you are here
 ```
+
+Step 10 split into two for the same reason Stage 5 became 5a/5b/5c: a
+request/response message and a server-initiated push stream are independently
+testable, and landing them together would mean debugging a codec problem and a
+fan-out problem at the same time. 10a is done and is useful on its own — the
+console can poll it.
 
 The visibility track comes first on purpose. Right now the only proof the engine
 works is a green ctest line and a `nc` session; the frontend turns that into
@@ -87,6 +96,9 @@ change you can see happen rather than a change you have to trust.
 | 2026-08-30 | `b439ff7` | Stage 5b: bounded work queue and jthread-based worker pool |
 | 2026-08-30 | `f43a9fb` | Stage 5c: wire the protocol and the pools into the event loop |
 | 2026-08-30 | `0d86ae4` | Comments to English: `proto/` and `concurrent/` headers |
+| 2026-09-02 | `d2216c9` | Refactor tests in Buffer and Version for clarity and consistency |
+| 2026-09-02 | *(pending)* | Tests restructured to Arrange-Act-Assert; pytest end-to-end suite added |
+| 2026-09-02 | *(pending)* | Step 10a: `get_stats` — the engine reports on itself |
 
 Stage 5 was split into three commits (a/b/c) on purpose: the protocol, the
 threading, and the wiring are independently testable, and landing them together
@@ -512,11 +524,14 @@ Every fixture teardown re-checks the invariants.
 
 #### Suite totals
 
-151 test cases across ten files. The 28 socket tests
+157 GoogleTest cases across ten files. The 28 socket tests
 ([test_echo_server.cpp](tests/test_echo_server.cpp),
 [test_ledger_server.cpp](tests/test_ledger_server.cpp)) build on Linux only; CI
 runs all of them plus the TSan and ASan matrix on every push
 ([.github/workflows/ci.yml](.github/workflows/ci.yml)).
+
+A further 41 black-box cases live in [tests/e2e/](tests/e2e/) and drive the real
+binary over a socket — see [Appendix E](#appendix-e--the-test-suites).
 
 ---
 
@@ -607,48 +622,148 @@ Real numbers, and a defensible answer to "how many workers, and why that many".
 
 ---
 
-# Step 10 — Observability surface: the engine reports on itself
-`[Backend]` `[Protocol]` `[Visibility]` — ⬜ **Next**
+# Step 10a — Observability: `get_stats`, the engine reports on itself
+`[Backend]` `[Protocol]` `[Visibility]` — ✅ Done
 
-### What is expected to be performed after this stage
+### What was expected to be performed after this stage
 - A `stats` request/response pair so any client can read live engine state.
-- An event stream (`subscribe`) so a client is *pushed* transfer and connection
-  events instead of polling.
 - The numbers reported must be the engine's real counters — a dashboard that
   displays invented data is worse than no dashboard.
+- It must not slow down the thing it measures.
+
+### How it was done
+
+**Most of the data already existed.** Every counter this needed was already
+maintained and already correct; it was simply trapped inside the process, printed
+once at shutdown and then lost ([main.cpp:149](src/main.cpp#L149)). This step is
+a seam, not a new subsystem.
+
+| What the console will show | Where the number comes from |
+|---|---|
+| Requests submitted / completed / rejected / dropped, per pool | [ThreadPool](include/ledger/concurrent/ThreadPool.h#L147) |
+| Live queue depth and capacity — backpressure, visible | [BlockingQueue](include/ledger/concurrent/BlockingQueue.h#L201) |
+| Active and cumulative connections | [LedgerServer](include/ledger/net/LedgerServer.h) |
+| Transfers committed / rejected | `LedgerCore::transferCount()`, `rejectedCount()` |
+| Accounts loaded | `AccountRegistry::size()` |
+| Uptime | `steady_clock` captured in the server's constructor |
+
+**The message.** `get_stats` (`0x0004`) answers with `stats` (`0x8004`), appended
+to the frozen code list, never inserted. Named `get_stats` rather than `stats` so
+the request and the response have distinct names — two entries sharing a name
+would break the reverse lookup silently, which is what
+`ProtoNames.MsgTypeNamesRoundTrip` exists to catch. Twenty `int64` fields,
+declared once in `fields()`
+([Messages.h](include/ledger/proto/Messages.h)), so both codecs picked them up
+with no encoder written by hand.
+
+Everything is `int64` because the wire has exactly five primitives, and adding a
+sixth for one message would mean a new dispatch arm in four codec paths. Counts,
+depths, capacities and a millisecond duration are all naturally integers, so
+nothing is distorted by the choice.
+
+**The two pools are reported separately**, not summed. They *are* separate:
+different queues, different worker counts, different traffic. Summing them would
+hide precisely the case the bounded queue exists for — one port saturated while
+the other sits idle.
+
+**The dependency problem, and the seam that solves it.** `LedgerRequestHandler`
+lives in `core/`; the counters live in `net/`. Having core depend on net would
+make the ledger unbuildable without epoll, undoing the two-platform property that
+has already caught a real bug. So an abstract `ServerStatsSource` sits in
+[common/ServerStats.h](include/ledger/common/ServerStats.h), `LedgerServer`
+implements it ([LedgerServer.cpp](src/net/LedgerServer.cpp)), and the handler
+holds a nullable pointer to it. The handler never learns that sockets exist.
+
+The pointer is nullable on purpose: a handler built without a server still answers
+the ledger half and reports zeros for the rest. A monitoring call that errors out
+is worse than one that admits it knows less.
+
+**What is deliberately absent: "does the ledger balance?"** That is the panel a
+dashboard most wants, and it is the one thing this message must not carry.
+Answering it means `LedgerCore::verifyInvariants()`, which takes `auditMutex_`
+**exclusively** and recomputes every account from the journal
+([LedgerCore.cpp:180](src/core/LedgerCore.cpp#L180)) — it stops every transfer in
+the system. A console polling once a second would freeze the engine once a second:
+the act of watching would change what is being watched. That number needs a
+rate-limited background audit, which is its own piece of work rather than a field
+smuggled into a hot path.
+
+So `onGetStats` ([LedgerRequestHandler.cpp:94](src/core/LedgerRequestHandler.cpp#L94))
+takes no ledger lock at all. Every read is an atomic load except the two queue
+depths, which borrow the queue's mutex for the length of a `size()` call.
+
+The snapshot is honest about what it is: fields are read one after another
+without a global lock, so a busy engine can return numbers microseconds apart.
+That is the right trade — the alternative is stopping the world to count.
+
+📁 [common/ServerStats.h](include/ledger/common/ServerStats.h) ·
+[proto/Messages.h](include/ledger/proto/Messages.h) ·
+[core/LedgerRequestHandler.cpp:94](src/core/LedgerRequestHandler.cpp#L94) ·
+[net/LedgerServer.cpp](src/net/LedgerServer.cpp) ·
+[proto/BinaryCodec.cpp](src/proto/BinaryCodec.cpp) ·
+[proto/JsonCodec.cpp](src/proto/JsonCodec.cpp)
+
+### Outcome — the engine answers questions about itself
+
+```
+$ {"id":"1","type":"get_stats"}
+  accounts 5, transfers_committed 4, connections_active 1, json_submitted 1
+
+$ {"id":"2","type":"transfer","idem_key":"demo","from":"1001","to":"2002","amount":"2500","ccy":"USD"}
+  {"from_balance":"112500","to_balance":"49500","tx_id":"900004","type":"transfer_ok"}
+
+$ {"id":"3","type":"get_stats"}
+  accounts 5, transfers_committed 5, connections_active 1, json_submitted 3
+```
+
+Verified against the real binary, not only in tests. Note `transfers_committed`
+starts at **4**, not 0: seeding the demo accounts goes through real transfers out
+of a system account rather than writing balances directly, and the counter is
+honest about that instead of quietly excluding them.
+
+| Test | What it would catch |
+|---|---|
+| `CodecGolden.StatsResponseLayout` | Byte-level layout of all 20 fields. Reordering `fields()` is invisible to a round-trip test |
+| `CodecGolden.StatsResponseJsonLayout` | Every counter quoted — a bare number loses precision in the browser the console runs in |
+| `LedgerServerFixture.StatsReportsLiveCounters` | Numbers must move with real traffic; also that the two pools stay separate |
+| `LedgerServerFixture.StatsIsAvailableOnTheBinaryPortToo` | Same message, other encoding, other pool |
+| `LedgerServerFixture.StatsStaysCheapUnderTraffic` | The monitoring path taking a ledger lock |
+| `tests/e2e/test_stats.py` (9 cases) | The full contract from outside: every documented field present, every one a string, counters live, uptime advancing, pools counted separately |
+
+Verified by breaking the code — including one break that the tests **failed** to
+catch on the first attempt. See [Appendix B](#appendix-b--how-correctness-was-verified).
+
+---
+
+# Step 10b — Observability: a pushed event stream
+`[Backend]` `[Protocol]` `[Visibility]` — ⬜ Next
+
+### What is expected to be performed after this stage
+- A `subscribe` request, after which the server *pushes* events — transfers as
+  they commit, connections opening and closing — instead of being polled.
+- A rate-limited background audit, so the console can honestly show whether the
+  ledger balances (the number Step 10a deliberately refused to compute inline).
 
 ### How it will be done
-Most of the data already exists; it is just trapped inside the shutdown printout
-at [src/main.cpp:149](src/main.cpp#L149). This step exposes it over the wire:
+The polling path from 10a is already enough for a working console, so this is an
+improvement rather than a prerequisite — which is exactly why it was split off.
 
-| What the console shows | Where the number already comes from |
-|---|---|
-| Requests submitted / completed / rejected / dropped, per pool | [ThreadPool](include/ledger/concurrent/ThreadPool.h#L147) — `submitted()`, `completed()`, `rejected()`, `droppedNoSink()` |
-| Live queue depth (backpressure, visible) | [BlockingQueue](include/ledger/concurrent/BlockingQueue.h) |
-| Active and cumulative connections | [LedgerServer::activeCount_](include/ledger/net/LedgerServer.h#L178), `totalConnections()` |
-| Transfers committed / rejected | `LedgerCore::transferCount()`, `rejectedCount()` |
-| "The ledger balances" | `LedgerCore::verifyInvariants()` |
-| All account balances at once, consistently | `LedgerCore::audit()` ([LedgerCore.h:102](include/ledger/core/LedgerCore.h#L102)) — already takes `auditMutex_` exclusively, so the snapshot is coherent |
+The hard part is not the message; it is that events are **server-initiated**,
+which the protocol has never had. Every existing response answers a request and
+carries its `reqId`. An event answers nothing, so it needs a defined `reqId`
+convention (the subscription's id is the likely answer) and both codecs need to
+accept a response arriving unprompted.
 
-Work to do:
-1. Add `Stats`/`StatsResp` (and `Subscribe`/`Event`) to
-   [Messages.h](include/ledger/proto/Messages.h) — **append** new `MsgType`
-   values; the existing numbers are frozen and never reused. Declaring `fields()`
-   once means both codecs pick them up for free.
-2. Handle them in [LedgerRequestHandler](src/core/LedgerRequestHandler.cpp#L27) —
-   `std::visit` will not compile until every new type has an arm.
-3. Byte-level golden entries in [tests/test_codec.cpp](tests/test_codec.cpp), the
-   same as every other message.
-4. For the push stream, keep the existing rule: **only the loop thread writes to
-   sockets**. Events fan out via `Connection::send()` / `runInLoop`, never from a
-   worker directly.
-5. Counters read for display must be `memory_order_relaxed` atomics — a dashboard
-   read must not perturb the thing it is measuring.
+The existing rule holds and constrains the design: **only the loop thread writes
+to sockets**. Events fan out via `Connection::send()` and `runInLoop`, never from
+a worker directly — two threads writing to one socket interleave their bytes and
+desynchronise the framing, and ThreadSanitizer would never flag it because
+`write()` is thread-safe.
 
-### Expected outcome
-`{"id":"1","type":"stats"}` over `nc` returns the live state of the engine. The
-frontend then has something true to render, and Step 8's load tests get their
-metrics for free.
+Backpressure applies to events too: a subscriber that stops reading must not be
+allowed to grow the server's output buffer without limit. The bounded-queue
+reasoning from Step 5 applies unchanged — drop events for a slow subscriber and
+tell it how many were dropped, rather than growing forever.
 
 ---
 
@@ -774,11 +889,45 @@ was confirmed by breaking the code and watching the test catch it:
 | 4 | Skip the `EPOLLOUT` registration | 3,994,597 of 4,194,304 bytes arrive |
 | 5 | `notify_all` → `notify_one` in `close()` | Process hangs forever with no output; killed by the ctest timeout |
 | 5 | `tryPush` → blocking `push` in `submit()` | 200 submissions take 9,780 ms instead of under 1 ms |
+| 10a | Swap two adjacent entries in `StatsResp::fields()` | `CodecGolden.StatsResponseLayout` fails on two transposed 8-byte groups. **Every round-trip test still passes** — the demonstration that they structurally cannot see this |
+| 10a | Call `verifyInvariants()` inside `onGetStats()` | 200 stats queries go from **38 ms to 1,637 ms** — but only after the test was fixed. See below |
 
-Note what the failure *shapes* are. Two of the six do not fail an assertion at
+Note what the failure *shapes* are. Two of these do not fail an assertion at
 all — they never return. A missed notification and a lock-order deadlock both
 present as a hang, so the ctest timeout is the only thing that can judge them.
 That is why `gtest_discover_tests` sets one.
+
+#### The Step 10a break that was not caught — and what it cost to fix
+
+The second Step 10a row is the most instructive entry in this table, because the
+first attempt **failed to catch the bug**.
+
+`StatsStaysCheapUnderTraffic` was written to prove that the monitoring path does
+not take the ledger's audit lock. The deliberate break — calling
+`verifyInvariants()` inside `onGetStats()` — was applied, and the test passed in
+24 ms. It was decoration: a test that could not fail.
+
+The reason is scale. The fixture seeds five accounts, and `verifyInvariants()`
+costs *O(accounts × their entries)*. At five accounts it is too cheap to measure,
+so the exclusive lock it takes never becomes visible. Two rounds of strengthening
+were needed, each measured rather than guessed:
+
+| Test shape | Time with the break |
+|---|---|
+| 5 accounts, 1 traffic client | 24 ms — passed, proving nothing |
+| 5,000 accounts, 4 traffic clients | 455 ms — still under the bound |
+| **20,000 accounts, 4 traffic clients** | **1,637 ms — caught it** |
+
+The clean build then measured 37, 38 and 39 ms across three runs. The bound was
+set at **800 ms**: twenty times the honest value, so a loaded CI machine cannot
+turn it red by accident, and half the broken value, so it cannot miss.
+
+Two things worth keeping from this. First, the bound is *measured from both
+sides* — a threshold picked without knowing the broken value is a guess about
+whether the test works. Second, a test at toy scale can be structurally unable to
+observe the property it claims to check; the fix was to make the fixture resemble
+the situation the design decision was actually made for. A ledger with five
+accounts was never the case worth defending against.
 
 ### 2. Sanitizers
 
@@ -796,7 +945,16 @@ protocol — but `write()` is thread-safe, so this is not a data race and
 ThreadSanitizer will never flag it. That bug is prevented structurally instead, by
 funnelling every socket write through the loop thread.
 
-### 3. Building on two platforms
+### 3. Two suites at different altitudes
+
+The GoogleTest suite calls the C++ API directly and proves each layer correct in
+isolation. The pytest suite starts the finished binary and speaks to it over a
+socket, proving the layers are *assembled* correctly — a system can be built from
+correct parts and still be wired together wrongly, and only an outside view sees
+that. Details and the reasoning for keeping both are in
+[Appendix E](#appendix-e--the-test-suites).
+
+### 4. Building on two platforms
 
 Everything except `net/` builds and runs natively on macOS; `net/` needs `epoll`,
 `eventfd`, and `accept4`, so it compiles only on Linux and the server runs in the
@@ -832,6 +990,9 @@ one is not arbitrary.
 | Weak pointers in both lifetime directions | A cycle leaks every closed connection — a failure that never crashes, it just grows |
 | Demo data injected by transfer, never by setting balances | Otherwise I2 is false from the first row and the main referee is broken from the start |
 | Framing errors close the connection; decode errors do not | Once the stream cannot be realigned, reading on only produces more noise |
+| `get_stats` takes no ledger lock, and reports no invariant check | Answering "does it balance?" stops every transfer; a polling console would freeze the engine at its poll rate |
+| The stats source is an interface in `common/`, not a `net/` type | `core/` must not depend on `net/`, or the ledger stops building without epoll |
+| The two thread pools are reported separately, never summed | Summing hides one port saturated while the other is idle — the exact case backpressure exists for |
 
 ---
 
@@ -861,6 +1022,7 @@ and the Step 8 load script depend on them
 | `ping` | `0x0001` | `pong` | `0x8001` |
 | `transfer` | `0x0002` | `transfer_ok` | `0x8002` |
 | `get_account` | `0x0003` | `account` | `0x8003` |
+| `get_stats` | `0x0004` | `stats` | `0x8004` |
 | | | `error` | `0x80FF` |
 
 The high bit means "this is a response". A response type arriving as a request is
@@ -879,7 +1041,34 @@ Field order below is `fields()` order, which **is** the binary payload order
 | `transfer_ok` | `tx_id` (i64) · `from_balance` (i64) · `to_balance` (i64) |
 | `get_account` | `account_id` (i64) |
 | `account` | `id` (i64) · `balance` (i64) · `ccy` (currency) · `status` (`ACTIVE` / `CLOSED`) |
+| `get_stats` | *(none)* |
+| `stats` | 20 i64 fields, listed below |
 | `error` | `code` (ErrorCode) · `message` (string) |
+
+**`stats` fields**, in `fields()` order — which is the binary payload order:
+
+| Field | Meaning |
+|---|---|
+| `uptime_ms` | Milliseconds since the server was constructed (`steady_clock`, so a wall-clock adjustment cannot make it jump) |
+| `accounts` | Accounts currently loaded |
+| `connections_active` | Connections open right now |
+| `connections_total` | Connections accepted since start |
+| `transfers_committed` | Includes the 4 seed transfers — money never appears from nowhere, so seeding is real transfers |
+| `transfers_rejected` | Refused for any reason |
+| `binary_workers` / `json_workers` | Threads in each pool |
+| `binary_queue_depth` / `json_queue_depth` | Work waiting right now — backpressure, live |
+| `binary_queue_capacity` / `json_queue_capacity` | The bound the queue refuses beyond |
+| `binary_submitted` / `json_submitted` | Tasks that made it into the queue |
+| `binary_completed` / `json_completed` | Handler invocations that finished |
+| `binary_rejected` / `json_rejected` | Refused with `SERVER_BUSY` — the direct measure of backpressure |
+| `binary_dropped` / `json_dropped` | Results discarded because the client had already gone |
+
+The two pools are reported separately because they are separate. Summing them
+would hide one port being saturated while the other is idle.
+
+**No field says whether the ledger balances.** That answer requires
+`verifyInvariants()`, which stops every transfer in the system; a polling console
+would freeze the engine at its polling rate. See Step 10a.
 
 Both legs of a transfer must already be in `ccy`; there is no FX in v1.
 
@@ -988,26 +1177,139 @@ Alice sends $50.00 to Bob — which is why 1001 lands on `115000` and 2002 on
 
 ---
 
+## Appendix E — The test suites
+
+Two suites, at different altitudes, both required.
+
+| | `tests/*.cpp` | `tests/e2e/*.py` |
+|---|---|---|
+| Framework | GoogleTest, run by `ctest` | pytest |
+| Count | 157 cases, ten files | 41 cases, four files |
+| How it reaches the code | Calls the C++ API directly | Starts the real binary, talks TCP |
+| What it proves | Each layer is correct in isolation | The layers are assembled correctly |
+| Command | `make test` | `make e2e` |
+| Platform | All but 28 socket tests run on macOS | Linux only (the server needs epoll) |
+
+### Why both, and why pytest cannot replace GoogleTest
+
+The C++ tests call functions — `exponentOf(Currency::USD)`, `LedgerCore::transfer`,
+`BlockingQueue::tryPush`. pytest is a Python runner; reaching those from Python
+would mean building and maintaining a pybind11 binding layer whose only purpose is
+to run tests, adding a component that can itself be wrong and making the sanitizer
+builds substantially harder to run.
+
+What pytest is genuinely good for here is the layer the C++ tests structurally
+cannot reach: the assembled program, seen from outside. A system can be built from
+perfectly correct parts and still be wired together wrongly — responses routed to
+the wrong connection, a currency exponent applied correctly in `LedgerCore` and
+then lost in the JSON encoder. Only a black-box view catches that.
+
+It also pays forward. These 32 tests assert only on what a browser, a load script,
+or a person with `nc` could observe, so when Step 6 replaces the in-memory ledger
+with PostgreSQL they should keep passing **without a single change**. If they
+don't, something user-visible broke. That makes them the acceptance criteria for
+the storage swap, and later for the Step 11 gateway, which will speak this exact
+protocol.
+
+### Structure: Arrange-Act-Assert
+
+Every test in both suites is written in three labelled phases. The labels are
+literal comments, because a reader skimming a 600-line file should be able to find
+the one line that actually does the thing:
+
+```cpp
+TEST(Buffer, PartialRetrieveLeavesRemainder) {
+  // Arrange
+  Buffer buf;
+  buf.append("hello world");
+
+  // Act
+  const std::string consumed = buf.retrieveAsString(6);
+
+  // Assert
+  EXPECT_EQ(consumed, "hello ");
+  EXPECT_EQ(buf.view(), "world");
+}
+```
+
+Four variations are allowed, and each must say which it is, so that a missing
+label reads as an omission rather than a style choice:
+
+| Situation | Label |
+|---|---|
+| No setup needed | Start at `// Act` |
+| A pure fact table — a currency's exponent is a constant, not something you *do* | `// Assert only`, plus why |
+| Action and check genuinely interleave (a stream arriving in pieces) | `// Act & Assert` |
+| Shared setup for a fixture | `// Arrange（共用）` on `SetUp()` |
+
+An empty Arrange block is never invented to satisfy the pattern. AAA exists to
+make structure obvious, not to be decorated onto tests that do not have it.
+
+**Concurrency tests have a specific shape**: the Act phase spawns the threads *and
+joins them all*. No assertion may run while a thread is still going — otherwise a
+racy interleaving can be mistaken for a passing run, which is the exact failure
+these tests exist to prevent.
+
+### What the pytest suite covers
+
+| File | Cases | What it checks |
+|---|---|---|
+| [test_protocol.py](tests/e2e/test_protocol.py) | 20 | Handshake, account lookup, transfer, and every refusal path — each asserting the ledger is untouched. Both failure modes: a decode error keeps the connection, a framing error closes it |
+| [test_money_rules.py](tests/e2e/test_money_rules.py) | 8 | The JPY exponent survives the whole journey; integers come back quoted; a bare number is refused; 2⁵³+1 arrives intact; the two legs of a transfer cancel out |
+| [test_concurrency.py](tests/e2e/test_concurrency.py) | 4 | Eight clients doing opposing transfers conserve money exactly; twelve racers for three slices produce exactly three winners; thirty connections each get their own answers; fifty clients hanging up mid-flight do not kill the server |
+| [test_stats.py](tests/e2e/test_stats.py) | 9 | Every documented `stats` field present and quoted; counters move with real traffic; uptime advances; the two pools counted separately; monitoring does not disturb the ledger |
+
+Design rules, enforced by [instruction.md](instruction.md):
+
+- **Standard library only**, plus pytest. A socket and `json.loads` are the entire
+  client. Sharing code with the server would let a mistake cancel itself out —
+  the same reason the C++ integration tests hand-roll their own blocking client
+  instead of reusing `Connection`.
+- **One engine process per test.** The engine seeds its demo accounts at startup,
+  so a fresh process is a clean ledger; tests that move money cannot leak state
+  into each other, and each can assert against the documented starting balances.
+- **Ports come from the OS**, not hard-coded. Fixed ports collide with each other
+  and with whatever is already running on the machine.
+- **Readiness is detected by polling the port**, not by parsing stdout — the
+  startup banner is localised, and a test that greps for Chinese text would break
+  the moment those strings are translated.
+- **Shutdown is `SIGINT`, not `SIGKILL`.** The graceful path is part of what is
+  being tested: it drains the queue, prints the run summary, and re-checks the
+  invariants.
+
+One bug this suite found in its own first run, worth recording: a test used
+`req_id="after"` as a request id. The envelope's `id` is a `u32` carried as a
+string, so the server correctly rejected it — the test was wrong, not the server.
+That is the black-box suite doing its job on the protocol's actual contract rather
+than on an assumed one.
+
+---
+
 ## Where we are right now
 
-**Done: Steps 0 through 5.** The engine is a live, working TCP server. Two ports,
-24 worker threads, an in-memory ledger, 151 test cases, and a CI pipeline that
-runs them alongside ThreadSanitizer and AddressSanitizer builds on every push.
-`nc localhost 9001` is a functioning client today.
+**Done: Steps 0 through 5, and Step 10a.** The engine is a live, working TCP
+server that now reports on itself. Two ports, 24 worker threads, an in-memory
+ledger, 157 GoogleTest cases plus 41 black-box pytest cases, and a CI pipeline
+that runs both suites alongside ThreadSanitizer and AddressSanitizer builds on
+every push. `nc localhost 9001` is a functioning client today, and
+`{"id":"1","type":"get_stats"}` returns live queue depths, pool counters and
+transfer totals.
 
-**Not started: Steps 6 through 12.** The backend gap is persistence — nothing
-survives a restart, because `seedDemoAccounts()` is still standing in for
+**Not started: Steps 6 through 9, 10b, 11, 12.** The backend gap is persistence —
+nothing survives a restart, because `seedDemoAccounts()` is still standing in for
 `SELECT id, balance FROM accounts`. The presentation gap is the one being closed
-first.
+first, and it is now one step smaller.
 
-**Immediately next — the visibility track, in this order:**
+**Immediately next — the rest of the visibility track, in this order:**
 
-1. **Step 10** — add `stats` and an event stream to the protocol. Small, mostly
-   plumbing counters that already exist out through the wire. Do this first: the
-   frontend is only worth building on top of numbers that are real.
+1. **Step 10b** — the pushed event stream, plus a rate-limited background audit so
+   the console can honestly show whether the ledger balances. Polling from 10a is
+   already enough to build a console on, so this is an improvement rather than a
+   blocker.
 2. **Step 11** — the gateway process, plus publishing port 9001 in
    [docker-compose.yml](docker-compose.yml).
-3. **Step 12** — the web console itself.
+3. **Step 12** — the web console itself, rendering what `get_stats` already
+   returns.
 
 **Then the backend track resumes at Step 6** (PostgreSQL), with the console
 already running — so swapping memory for durable storage is a change that can be
@@ -1017,7 +1319,9 @@ worked.
 ### What is runnable today
 
 ```bash
-make test          # the full suite, no Docker needed
+nc localhost 9001  # then: {"id":"1","type":"get_stats"}
+make test          # the C++ suite (GoogleTest), no Docker needed
+make e2e           # the black-box suite (pytest) against a real server — Linux
 make db-all        # reset schema, seed, 22 constraint tests, invariant check
 make up            # Postgres 16 + Linux build container
 docker compose exec engine bash -c './build/src/ledger_engine'

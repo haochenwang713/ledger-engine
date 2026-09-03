@@ -7,6 +7,10 @@
 //   就等於把要測的東西測掉了。
 //
 // 只在 Linux 上編譯 —— macOS 沒有 epoll。
+//
+// Test structure: Arrange-Act-Assert. The shared Arrange — an event loop on a
+// background thread and a listening server on an ephemeral port — lives in
+// ServerFixture::SetUp(). See instruction.md for the convention.
 // ---------------------------------------------------------------------------
 
 #include <ledger/net/EchoServer.h>
@@ -100,6 +104,7 @@ class TestClient {
 /// 在背景執行緒跑 event loop，測試結束時乾淨關閉。
 class ServerFixture : public ::testing::Test {
  protected:
+  // Arrange（共用）—— 每條測試都從「一台在跑的 echo server」開始。
   void SetUp() override {
     ASSERT_TRUE(loop_.valid()) << "epoll 或 eventfd 建立失敗";
 
@@ -137,19 +142,24 @@ class ServerFixture : public ::testing::Test {
 // === 基本連通 ==============================================================
 
 TEST_F(ServerFixture, EchoesASmallMessage) {
+  // Arrange
   TestClient client(port_);
   ASSERT_TRUE(client.connected());
-
   const std::string message = "hello ledger";
+
+  // Act
   ASSERT_TRUE(client.sendAll(message));
 
+  // Assert
   EXPECT_EQ(client.recvExactly(message.size()), message);
 }
 
 TEST_F(ServerFixture, HandlesManySequentialMessages) {
+  // Arrange
   TestClient client(port_);
   ASSERT_TRUE(client.connected());
 
+  // Act & Assert —— 五百次來回，每次都要對。
   for (int i = 0; i < 500; ++i) {
     const std::string message = "msg-" + std::to_string(i);
     ASSERT_TRUE(client.sendAll(message));
@@ -169,14 +179,17 @@ TEST_F(ServerFixture, HandlesManySequentialMessages) {
 // 這個 bug 用小訊息測永遠測不出來。這就是為什麼要刻意送 1 MB。
 // ===========================================================================
 TEST_F(ServerFixture, EdgeTriggeredReadDrainsTheEntireSocket) {
+  // Arrange —— 1 MB，遠超過 kReadChunk（64 KB），
+  // 保證伺服器必須迴圈讀很多次。
   TestClient client(port_);
   ASSERT_TRUE(client.connected());
-
-  // 1 MB，遠超過 kReadChunk（64 KB），保證需要迴圈讀很多次
   const std::string big(1024 * 1024, 'A');
-  ASSERT_TRUE(client.sendAll(big));
 
+  // Act
+  ASSERT_TRUE(client.sendAll(big));
   const std::string echoed = client.recvExactly(big.size());
+
+  // Assert
   ASSERT_EQ(echoed.size(), big.size()) << "只收到 " << echoed.size() << " / " << big.size()
                                        << " 位元組 —— ET 模式沒有讀到 EAGAIN，連線靜默了";
   EXPECT_EQ(echoed, big);
@@ -200,19 +213,21 @@ TEST_F(ServerFixture, EdgeTriggeredReadDrainsTheEntireSocket) {
 // 教訓：測試「通過」不等於它有在測東西。要驗證它抓不抓得到才算數。
 // ===========================================================================
 TEST_F(ServerFixture, HandlesPartialWritesWhenClientStopsReading) {
+  // Arrange
   TestClient client(port_);
   ASSERT_TRUE(client.connected());
-
   const std::string big(4 * 1024 * 1024, 'B');
-  ASSERT_TRUE(client.sendAll(big));
 
-  // ★ 送完就停手。此刻伺服器手上還有一大堆寫不出去的回應，
-  //   而且不會再有任何讀取事件進來驅動它。
+  // Act —— 送完就停手。此刻伺服器手上還有一大堆寫不出去的回應，
+  //        而且不會再有任何讀取事件進來驅動它。
+  ASSERT_TRUE(client.sendAll(big));
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
   // 現在才開始讀。若 EPOLLOUT 有正確註冊，伺服器會被 kernel 叫醒續寫，
   // 一個位元組都不會少。
   const std::string echoed = client.recvExactly(big.size());
+
+  // Assert
   ASSERT_EQ(echoed.size(), big.size()) << "只收到 " << echoed.size() << " / " << big.size()
                                        << " 位元組 —— 部分寫入沒有處理，剩下的回應石沉大海";
   EXPECT_EQ(echoed, big);
@@ -221,12 +236,13 @@ TEST_F(ServerFixture, HandlesPartialWritesWhenClientStopsReading) {
 // === 併發連線 ==============================================================
 
 TEST_F(ServerFixture, ServesManyConcurrentClients) {
+  // Arrange
   constexpr int kClients = 50;
   constexpr int kMessagesEach = 20;
-
   std::atomic<int> failures{0};
-  std::vector<std::thread> threads;
 
+  // Act —— 50 個 client 各自來回 20 次，全部打在同一條 loop 執行緒上。
+  std::vector<std::thread> threads;
   for (int c = 0; c < kClients; ++c) {
     threads.emplace_back([&, c] {
       TestClient client(port_);
@@ -248,6 +264,7 @@ TEST_F(ServerFixture, ServesManyConcurrentClients) {
     t.join();
   }
 
+  // Assert
   EXPECT_EQ(failures.load(), 0);
   EXPECT_GE(server_->totalConnections(), static_cast<std::uint64_t>(kClients));
 }
@@ -255,6 +272,7 @@ TEST_F(ServerFixture, ServesManyConcurrentClients) {
 // === 生命週期 ==============================================================
 
 TEST_F(ServerFixture, CleansUpWhenClientDisconnects) {
+  // Arrange & Act —— 連上、來回一次，然後讓 client 解構。
   {
     TestClient client(port_);
     ASSERT_TRUE(client.connected());
@@ -262,7 +280,7 @@ TEST_F(ServerFixture, CleansUpWhenClientDisconnects) {
     ASSERT_EQ(client.recvExactly(3), "bye");
   }  // client 解構，socket 關閉
 
-  // 等伺服器察覺到並清掉。輪詢而不是 sleep 固定時間 ——
+  // Assert —— 等伺服器察覺到並清掉。輪詢而不是 sleep 固定時間：
   // 前者在快的機器上瞬間結束，慢的機器上也不會誤判。
   for (int i = 0; i < 500 && server_->activeConnections() > 0; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -275,23 +293,26 @@ TEST_F(ServerFixture, CleansUpWhenClientDisconnects) {
 // 這測的是 handleEvent 裡的順序：必須先 handleRead() 把資料讀完，
 // 才處理 hangup。寫反的話最後一批資料會消失。
 TEST_F(ServerFixture, ReadsDataSentImmediatelyBeforeClose) {
+  // Act & Assert —— 重複 20 次，因為這是時序相關的競爭。
   for (int attempt = 0; attempt < 20; ++attempt) {
+    // Arrange
     TestClient client(port_);
     ASSERT_TRUE(client.connected());
+
     ASSERT_TRUE(client.sendAll("last words"));
     EXPECT_EQ(client.recvExactly(10), "last words") << "第 " << attempt << " 次嘗試";
   }
 }
 
 TEST_F(ServerFixture, SurvivesAbruptDisconnects) {
-  // client 連上就馬上斷，反覆很多次。伺服器不能崩、不能洩漏 fd。
+  // Act —— client 連上就馬上斷，反覆很多次。
   for (int i = 0; i < 200; ++i) {
     TestClient client(port_);
     ASSERT_TRUE(client.connected()) << "第 " << i << " 次連線失敗 —— 可能是 fd 洩漏";
     client.closeNow();
   }
 
-  // 還活著嗎？
+  // Assert —— 伺服器不能崩、不能洩漏 fd。還活著嗎？
   TestClient client(port_);
   ASSERT_TRUE(client.connected());
   ASSERT_TRUE(client.sendAll("still alive"));
@@ -301,9 +322,11 @@ TEST_F(ServerFixture, SurvivesAbruptDisconnects) {
 // === EventLoop ============================================================
 
 TEST_F(ServerFixture, RunInLoopExecutesTasksOnLoopThread) {
+  // Arrange
   std::atomic<bool> ran{false};
   std::atomic<bool> onLoopThread{false};
 
+  // Act
   loop_.runInLoop([&] {
     onLoopThread.store(loop_.inLoopThread());
     ran.store(true);
@@ -313,14 +336,17 @@ TEST_F(ServerFixture, RunInLoopExecutesTasksOnLoopThread) {
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
 
+  // Assert
   EXPECT_TRUE(ran.load()) << "eventfd 喚醒機制沒有生效";
   EXPECT_TRUE(onLoopThread.load()) << "工作沒有在 loop 執行緒上執行";
 }
 
 TEST_F(ServerFixture, RunInLoopHandlesManyCrossThreadTasks) {
+  // Arrange
   constexpr int kTasks = 2000;
   std::atomic<int> counter{0};
 
+  // Act —— 八條執行緒同時往 loop 丟工作。
   std::vector<std::thread> producers;
   for (int t = 0; t < 8; ++t) {
     producers.emplace_back([&] {
@@ -333,6 +359,7 @@ TEST_F(ServerFixture, RunInLoopHandlesManyCrossThreadTasks) {
     t.join();
   }
 
+  // Assert
   for (int i = 0; i < 1000 && counter.load() < kTasks; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }

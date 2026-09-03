@@ -1,6 +1,7 @@
 #include <ledger/core/LedgerRequestHandler.h>
 #include <ledger/net/LedgerServer.h>
 
+#include <chrono>
 #include <utility>
 
 namespace ledger::net {
@@ -86,14 +87,18 @@ LedgerServer::LedgerServer(EventLoop& loop,
       binaryAcceptor_(loop, options.binaryPort),
       jsonAcceptor_(loop, options.jsonPort),
       newlineSplitter_(proto::kMaxFrameSize),
+      // `this` as the stats source is safe despite being handed out mid
+      // construction: the factory only *stores* the pointer, and a worker cannot
+      // dereference it until a get_stats request arrives — which needs start()
+      // and a connected client, both long after this constructor returns.
       binaryPool_("binary",
                   options.binaryWorkers,
                   options.binaryQueueCapacity,
-                  makeLedgerHandlerFactory(core, registry)),
+                  makeLedgerHandlerFactory(core, registry, this)),
       jsonPool_("json",
                 options.jsonWorkers,
                 options.jsonQueueCapacity,
-                makeLedgerHandlerFactory(core, registry)) {
+                makeLedgerHandlerFactory(core, registry, this)) {
   binaryAcceptor_.setNewConnectionCallback(
       [this](int fd, std::string peer) { onNewConnection(fd, std::move(peer), Protocol::Binary); });
   jsonAcceptor_.setNewConnectionCallback(
@@ -102,6 +107,37 @@ LedgerServer::LedgerServer(EventLoop& loop,
 
 LedgerServer::~LedgerServer() {
   shutdown();
+}
+
+ServerStatsSnapshot LedgerServer::statsSnapshot() const {
+  // 順序無關緊要，因為這裡本來就不保證欄位之間互相一致 ——
+  // 見 common/ServerStats.h 對「coherent enough」的說明。
+  // 要讓它們一致就得停下全世界，而監控路徑絕不能做那件事。
+  ServerStatsSnapshot snapshot;
+
+  const auto elapsed = std::chrono::steady_clock::now() - startedAt_;
+  snapshot.uptimeMillis = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+
+  snapshot.connectionsActive = static_cast<std::int64_t>(activeConnections());
+  snapshot.connectionsTotal = static_cast<std::int64_t>(totalConnections());
+
+  snapshot.binaryWorkers = static_cast<std::int64_t>(binaryPool_.workerCount());
+  snapshot.binaryQueueDepth = static_cast<std::int64_t>(binaryPool_.queueSize());
+  snapshot.binaryQueueCapacity = static_cast<std::int64_t>(binaryPool_.queueCapacity());
+  snapshot.binarySubmitted = static_cast<std::int64_t>(binaryPool_.submitted());
+  snapshot.binaryCompleted = static_cast<std::int64_t>(binaryPool_.completed());
+  snapshot.binaryRejected = static_cast<std::int64_t>(binaryPool_.rejected());
+  snapshot.binaryDropped = static_cast<std::int64_t>(binaryPool_.droppedNoSink());
+
+  snapshot.jsonWorkers = static_cast<std::int64_t>(jsonPool_.workerCount());
+  snapshot.jsonQueueDepth = static_cast<std::int64_t>(jsonPool_.queueSize());
+  snapshot.jsonQueueCapacity = static_cast<std::int64_t>(jsonPool_.queueCapacity());
+  snapshot.jsonSubmitted = static_cast<std::int64_t>(jsonPool_.submitted());
+  snapshot.jsonCompleted = static_cast<std::int64_t>(jsonPool_.completed());
+  snapshot.jsonRejected = static_cast<std::int64_t>(jsonPool_.rejected());
+  snapshot.jsonDropped = static_cast<std::int64_t>(jsonPool_.droppedNoSink());
+
+  return snapshot;
 }
 
 Status LedgerServer::start() {

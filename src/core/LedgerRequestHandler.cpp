@@ -34,6 +34,8 @@ proto::ResponseEnvelope LedgerRequestHandler::handle(const proto::RequestEnvelop
           return onTransfer(env.reqId, msg);
         } else if constexpr (std::is_same_v<T, proto::GetAccountReq>) {
           return onGetAccount(env.reqId, msg);
+        } else if constexpr (std::is_same_v<T, proto::GetStatsReq>) {
+          return onGetStats(env.reqId);
         } else {
           static_assert(proto::kAlwaysFalse<T>, "有請求型別沒有被處理");
         }
@@ -89,12 +91,59 @@ proto::ResponseEnvelope LedgerRequestHandler::onGetAccount(std::uint32_t reqId,
   return proto::ResponseEnvelope{reqId, resp};
 }
 
-concurrent::HandlerFactory makeLedgerHandlerFactory(LedgerCore& core, AccountRegistry& registry) {
+proto::ResponseEnvelope LedgerRequestHandler::onGetStats(std::uint32_t reqId) {
+  // 這條路徑刻意「什麼都不鎖」。
+  //
+  // 它讀的每一個數字要嘛是 atomic load，要嘛是佇列的 size()（借一下
+  // queue 的 mutex，微秒等級）。沒有任何一個需要 auditMutex_。
+  //
+  // 為什麼這件事重要：verifyInvariants() 與 audit() 會拿 auditMutex_ 的
+  // unique_lock，也就是「停下全世界的轉帳」。儀表板每秒問一次，就等於
+  // 每秒把引擎凍結一次 —— 觀測行為本身改變了被觀測的對象。
+  // 那個數字要另外做（有速率上限的背景稽核），不能塞在這裡。
+  proto::StatsResp resp;
+
+  // --- 帳本這一側：handler 本來就有的東西 ---
+  resp.accounts = static_cast<Amount>(registry_.size());
+  resp.transfersCommitted = static_cast<Amount>(core_.transferCount());
+  resp.transfersRejected = static_cast<Amount>(core_.rejectedCount());
+
+  // --- 伺服器那一側：可能沒有（見標頭的說明）---
+  if (server_ != nullptr) {
+    const ServerStatsSnapshot snapshot = server_->statsSnapshot();
+
+    resp.uptimeMillis = snapshot.uptimeMillis;
+    resp.connectionsActive = snapshot.connectionsActive;
+    resp.connectionsTotal = snapshot.connectionsTotal;
+
+    resp.binaryWorkers = snapshot.binaryWorkers;
+    resp.binaryQueueDepth = snapshot.binaryQueueDepth;
+    resp.binaryQueueCapacity = snapshot.binaryQueueCapacity;
+    resp.binarySubmitted = snapshot.binarySubmitted;
+    resp.binaryCompleted = snapshot.binaryCompleted;
+    resp.binaryRejected = snapshot.binaryRejected;
+    resp.binaryDropped = snapshot.binaryDropped;
+
+    resp.jsonWorkers = snapshot.jsonWorkers;
+    resp.jsonQueueDepth = snapshot.jsonQueueDepth;
+    resp.jsonQueueCapacity = snapshot.jsonQueueCapacity;
+    resp.jsonSubmitted = snapshot.jsonSubmitted;
+    resp.jsonCompleted = snapshot.jsonCompleted;
+    resp.jsonRejected = snapshot.jsonRejected;
+    resp.jsonDropped = snapshot.jsonDropped;
+  }
+
+  return proto::ResponseEnvelope{reqId, resp};
+}
+
+concurrent::HandlerFactory makeLedgerHandlerFactory(LedgerCore& core,
+                                                    AccountRegistry& registry,
+                                                    const ServerStatsSource* server) {
   // 這個 lambda 會在每一條 worker 執行緒上各被呼叫一次。
   // 捕捉的是參照（core 與 registry 的生命週期比 pool 長），
   // 產生的是每個 worker 專屬的 handler 實例。
-  return [&core, &registry](std::size_t /*workerIndex*/) {
-    return std::make_unique<LedgerRequestHandler>(core, registry);
+  return [&core, &registry, server](std::size_t /*workerIndex*/) {
+    return std::make_unique<LedgerRequestHandler>(core, registry, server);
   };
 }
 

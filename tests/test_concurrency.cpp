@@ -15,6 +15,10 @@
 //   make test           一般建置
 //   make tsan           ThreadSanitizer —— 會抓到「還沒造成錯誤的」資料競爭
 //   make asan           AddressSanitizer —— 會抓到 use-after-free
+//
+// Test structure: Arrange-Act-Assert. Here the Act phase is "spawn the threads
+// and join them" — every assertion waits until every thread has finished, so a
+// racy interleaving cannot be mistaken for a passing run. See instruction.md.
 // ---------------------------------------------------------------------------
 
 #include <ledger/core/AccountRegistry.h>
@@ -66,6 +70,7 @@ std::vector<AccountId> makeAccounts(AccountRegistry& registry,
 //   這條斷言沒有任何模糊空間：差一塊錢都是 bug。
 // ===========================================================================
 TEST(Concurrency, TotalMoneyIsConserved) {
+  // Arrange
   AccountRegistry registry;
   Journal journal;
   LedgerCore core(registry, journal);
@@ -82,6 +87,7 @@ TEST(Concurrency, TotalMoneyIsConserved) {
   std::atomic<int> succeeded{0};
   std::atomic<int> rejected{0};
 
+  // Act —— 32 條執行緒各自轉 3000 筆，然後全部 join。
   std::vector<std::thread> threads;
   threads.reserve(kThreadCount);
 
@@ -120,7 +126,7 @@ TEST(Concurrency, TotalMoneyIsConserved) {
     thread.join();
   }
 
-  // --- 判決 ---------------------------------------------------------------
+  // --- Assert（判決）------------------------------------------------------
 
   // I3：總量守恆。差一塊錢都是 race condition。
   EXPECT_EQ(core.totalBalance(Currency::USD), expectedTotal)
@@ -154,6 +160,7 @@ TEST(Concurrency, TotalMoneyIsConserved) {
 // 由 ctest 的逾時機制判定失敗。這是這類測試的常態。
 // ===========================================================================
 TEST(Concurrency, OppositeDirectionTransfersDoNotDeadlock) {
+  // Arrange
   AccountRegistry registry;
   Journal journal;
   LedgerCore core(registry, journal);
@@ -165,6 +172,8 @@ TEST(Concurrency, OppositeDirectionTransfersDoNotDeadlock) {
   const AccountId b = ids[1];
 
   constexpr int kRounds = 20'000;
+
+  // Act
   std::vector<std::thread> threads;
 
   for (int t = 0; t < kThreadCount; ++t) {
@@ -188,7 +197,7 @@ TEST(Concurrency, OppositeDirectionTransfersDoNotDeadlock) {
     thread.join();
   }
 
-  // 能執行到這一行，就代表沒有死鎖。
+  // Assert —— 能執行到這一行，就代表沒有死鎖。
   EXPECT_EQ(core.totalBalance(Currency::USD), kInitialBalance * 2);
   EXPECT_TRUE(core.verifyInvariants());
 }
@@ -203,6 +212,7 @@ TEST(Concurrency, OppositeDirectionTransfersDoNotDeadlock) {
 // 帳戶會變成負的 —— 那就是憑空生出了錢。
 // ===========================================================================
 TEST(Concurrency, ConcurrentWithdrawalsCannotOverdraw) {
+  // Arrange
   AccountRegistry registry;
   Journal journal;
   LedgerCore core(registry, journal);
@@ -225,6 +235,8 @@ TEST(Concurrency, ConcurrentWithdrawalsCannotOverdraw) {
   }
 
   std::atomic<int> winners{0};
+
+  // Act
   std::vector<std::thread> threads;
 
   for (int t = 0; t < kThreadCount; ++t) {
@@ -250,7 +262,7 @@ TEST(Concurrency, ConcurrentWithdrawalsCannotOverdraw) {
     thread.join();
   }
 
-  // ★ 「恰好 10 筆」。多一筆就是憑空生錢，少一筆就是錢被吃掉。
+  // Assert —— ★ 「恰好 10 筆」。多一筆就是憑空生錢，少一筆就是錢被吃掉。
   EXPECT_EQ(winners.load(), kExpectedWinners);
   EXPECT_EQ(registry.find(pot)->balance(), 0);
   EXPECT_GE(registry.find(pot)->balance(), 0) << "來源帳戶變成負的 —— 超額扣款";
@@ -276,6 +288,7 @@ TEST(Concurrency, ConcurrentWithdrawalsCannotOverdraw) {
 //   Stage 8 壓測時要把這件事量化，並在 README 誠實寫出來。
 // ===========================================================================
 TEST(Concurrency, AuditSeesConsistentSnapshotDuringTraffic) {
+  // Arrange
   AccountRegistry registry;
   Journal journal;
   LedgerCore core(registry, journal);
@@ -289,6 +302,7 @@ TEST(Concurrency, AuditSeesConsistentSnapshotDuringTraffic) {
   std::atomic<int> auditsDuringTraffic{0};
   std::atomic<int> inconsistentAudits{0};
 
+  // Act —— 一邊持續轉帳，一邊持續對帳。
   std::vector<std::thread> workers;
   for (int t = 0; t < kThreadCount; ++t) {
     workers.emplace_back([&, t] {
@@ -331,7 +345,7 @@ TEST(Concurrency, AuditSeesConsistentSnapshotDuringTraffic) {
     worker.join();
   }
 
-  // ★ 核心斷言：每一次成功的對帳都必須看到正確的總額。
+  // Assert —— ★ 核心斷言：每一次成功的對帳都必須看到正確的總額。
   //   一次都不能錯 —— 對帳讀到不一致的快照，就是 auditMutex_ 沒發揮作用。
   EXPECT_EQ(inconsistentAudits.load(), 0) << auditsDuringTraffic.load() << " 次對帳中有 "
                                           << inconsistentAudits.load() << " 次讀到不一致的快照";
@@ -353,6 +367,7 @@ TEST(Concurrency, AuditSeesConsistentSnapshotDuringTraffic) {
 // 這條路徑上的錯誤是 use-after-free —— ASan 會抓到。
 // ===========================================================================
 TEST(Concurrency, RegistryGrowthDoesNotInvalidatePointers) {
+  // Arrange
   AccountRegistry registry;
   Journal journal;
   LedgerCore core(registry, journal);
@@ -360,7 +375,7 @@ TEST(Concurrency, RegistryGrowthDoesNotInvalidatePointers) {
   const auto ids = makeAccounts(registry, 4, Currency::USD, kInitialBalance);
   std::atomic<bool> stop{false};
 
-  // 一邊不停開新帳戶，逼 unordered_map 反覆 rehash
+  // Act —— 一邊不停開新帳戶，逼 unordered_map 反覆 rehash
   std::thread creator([&] {
     for (OwnerId i = 0; i < 20'000; ++i) {
       (void)registry.create(1'000'000 + i, Currency::EUR);
@@ -391,6 +406,7 @@ TEST(Concurrency, RegistryGrowthDoesNotInvalidatePointers) {
     worker.join();
   }
 
+  // Assert
   EXPECT_EQ(core.totalBalance(Currency::USD), kInitialBalance * 4);
   EXPECT_TRUE(core.verifyInvariants());
 }

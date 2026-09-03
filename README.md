@@ -152,6 +152,20 @@ assumes "divide by 100".
 
 ---
 
+**10. It can tell you how it is doing.**
+
+Ask it `get_stats` and it reports its own condition: how many accounts exist, how
+many transfers have gone through, how many were refused, how many clients are
+connected, and how much work is queued up waiting. These are real internal
+counters, not estimates.
+
+This matters more than it sounds. Until now the only evidence this engine works
+was a line of test output. Being able to ask it, at any moment, what it is
+currently doing is what turns it from something you take on trust into something
+you can watch.
+
+---
+
 ## A small glossary
 
 Every technical word used on this page, defined once.
@@ -177,6 +191,7 @@ Every technical word used on this page, defined once.
 | **Backpressure** | When a system is overloaded, politely saying "I am full, try again shortly" instead of accepting work it cannot do. |
 | **Idempotency** | The property that doing something twice has the same effect as doing it once. |
 | **Invariant** | A statement that must be true at all times, forever. "Total money never changes on its own" is one. |
+| **Polling** | Repeatedly asking "what's happening now?" — how a dashboard keeps itself up to date. It must be cheap to answer, or the asking slows down the thing being asked. |
 | **Database** | Software specialising in storing data safely and permanently, even if the power is cut. This project uses one called PostgreSQL. |
 | **Container** | A packaged mini-computer-inside-your-computer, so software runs identically on any machine. This project uses Docker for that. |
 | **Compiler** | A program that translates human-written source code into something the machine can actually execute. |
@@ -263,13 +278,26 @@ The first line downloads the project. The second moves you into its folder.
 make test
 ```
 
-This compiles the project and then runs its full self-check suite — 151 separate
+This compiles the project and then runs its full self-check suite — 157 separate
 tests, including ones that launch dozens of simultaneous transfers to try to break
 the accounting on purpose. It needs nothing installed beyond a compiler.
 
 You should finish with a line saying all tests passed. That single line is the
 project's core claim: money is conserved, overdrafts are impossible, and nothing
 deadlocks.
+
+There is a second suite that works differently:
+
+```bash
+make e2e
+```
+
+This one starts the engine for real and then talks to it over the network, the
+same way an app would — 41 tests that know nothing about the code inside, only
+what goes in and comes out. It needs Linux, so on a Mac run it inside the
+container (see Step 4). Together the two suites answer different questions: the
+first asks "is the logic right", the second asks "does the assembled thing
+actually behave".
 
 ### Step 3 — Start the database (optional)
 
@@ -405,16 +433,53 @@ What each part means:
 | `tx_id` | The engine's permanent reference number for this transaction |
 | `from_balance` / `to_balance` | The two new balances — $1,125.00 and $495.00 |
 
-### Command 4 — Try to spend money that is not there
+### Command 4 — "How are you doing?"
 
 ```json
-{"id":"4","type":"transfer","idem_key":"k2","from":"2002","to":"1001","amount":"99999999","ccy":"USD"}
+{"id":"4","type":"get_stats"}
+```
+
+Reply (shortened — there are twenty numbers in all):
+
+```json
+{"accounts":"5","transfers_committed":"5","transfers_rejected":"1",
+ "connections_active":"1","json_queue_depth":"0","json_workers":"4",
+ "uptime_ms":"1027","type":"stats","id":"4","v":1}
+```
+
+This is the engine describing its own condition, and it is the data the planned
+dashboard will draw. Some of the more useful numbers:
+
+| Number | What it tells you |
+|---|---|
+| `accounts` | How many accounts exist |
+| `transfers_committed` | Transfers that went through. **This starts at 4**, because even the opening balances were created by real transfers — money is never conjured into an account |
+| `transfers_rejected` | Requests refused, for any reason |
+| `connections_active` | How many clients are connected right now — including you |
+| `json_queue_depth` | How much work is waiting. If this climbs, the engine is falling behind |
+| `json_queue_capacity` | How much waiting work it accepts before saying "I'm full" |
+| `json_workers` | How many jobs it can do at the same time |
+| `uptime_ms` | Milliseconds since it started |
+
+Run it, do a transfer, then run it again — the numbers move.
+
+**One thing this deliberately does *not* report: whether the books balance.**
+That check re-adds the entire history of every account, and while it runs, every
+transfer in the system has to stop and wait. Asking once is fine. A dashboard
+asking every second would freeze the engine every second — the act of watching
+would change what is being watched. That number needs a different mechanism,
+which is separate planned work.
+
+### Command 5 — Try to spend money that is not there
+
+```json
+{"id":"5","type":"transfer","idem_key":"k2","from":"2002","to":"1001","amount":"99999999","ccy":"USD"}
 ```
 
 Reply:
 
 ```json
-{"code":"INSUFFICIENT_FUNDS","id":"4","message":"INSUFFICIENT_FUNDS","type":"error","v":1}
+{"code":"INSUFFICIENT_FUNDS","id":"5","message":"INSUFFICIENT_FUNDS","type":"error","v":1}
 ```
 
 Refused. This is the check that stops money being spent twice, and it is the single
@@ -498,6 +563,15 @@ transfers among the same handful of accounts, deliberately including the exact
 pattern that causes the freeze-forever bug, and then checks that the total amount
 of money is unchanged to the penny.
 
+**Two suites, asking different questions.** 157 tests examine the code from the
+inside, checking that each piece is correct on its own. A further 41 start the
+finished program and treat it as a stranger would — connect over the network, send
+requests, check the answers. The second set matters because a system can be built
+from perfectly correct parts and still be wired together wrongly; only an outside
+view catches that. Those 32 also become the safety net for the next stage: when
+permanent storage is added underneath, they should keep passing without a single
+change, and if they don't, something visible to users has broken.
+
 **Breaking the code deliberately, to prove the tests can catch it.** A test that
 cannot fail proves nothing. So each safety mechanism was removed one at a time to
 confirm the alarm actually sounds. For example, removing the rule that orders lock
@@ -530,15 +604,17 @@ passing.
 
 ## Where the project is now
 
-The engine works today. You can start it, connect to it, move money, and watch it
-refuse invalid requests. What it cannot yet do is **remember anything after being
-switched off** — right now everything lives in memory only. That is the next major
-piece of work.
+The engine works today. You can start it, connect to it, move money, watch it
+refuse invalid requests, and ask it how it is doing. What it cannot yet do is
+**remember anything after being switched off** — right now everything lives in
+memory only. That is still the biggest remaining piece of work, but the dashboard
+comes first, for the reason given below.
 
 | Step | What it delivers | Status |
 |---|---|---|
 | 0–5 | Design, build setup, storage structure, the accounting core, the networking layer, the message formats | ✅ Done |
-| 10 | The engine reports its own live statistics | ⬜ **Next** |
+| 10a | The engine reports its own live statistics — `get_stats` | ✅ Done |
+| 10b | The engine *pushes* updates as they happen, instead of being asked | ⬜ **Next** |
 | 11 | A bridge so a web browser can talk to it | ⬜ |
 | 12 | **A visual dashboard** — watch balances change, transfers arrive, and the safety mechanisms work, live in a browser | ⬜ |
 | 6 | Permanent storage, so nothing is lost on restart | ⬜ |
@@ -570,6 +646,7 @@ something you have to take on faith.
 ```bash
 make doctor     # check what is installed on your machine, and what is missing
 make test       # compile and run the full self-check suite
+make e2e        # start the real engine and test it over the network (Linux)
 make up         # start the database and the Linux container
 make shell      # step inside the Linux container
 make run        # start the engine (Linux only)

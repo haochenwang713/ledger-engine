@@ -1,8 +1,10 @@
 // ---------------------------------------------------------------------------
 // ledger_engine —— 進入點。
 //
-// Stage 5（目前）：跑起完整的 LedgerServer —— 兩個 port、兩組執行緒池、
+// Stage 5：       跑起完整的 LedgerServer —— 兩個 port、兩組執行緒池、
 //                  記憶體帳本。帳戶資料由 seedDemoAccounts() 載入。
+// Step 10（目前）：get_stats —— 引擎會報告自己的即時狀態，
+//                  Step 12 的網頁儀表板就是靠這個畫出來的。
 // Stage 6：       seedDemoAccounts() 會被 "SELECT id, balance FROM accounts"
 //                 取代，handler 工廠會為每個 worker 開一條 pqxx::connection。
 // ---------------------------------------------------------------------------
@@ -57,6 +59,8 @@ void printUsage() {
             << R"(  {"id":"1","type":"ping"})"
             << "\n"
             << R"(  {"id":"2","type":"get_account","account_id":"1001"})"
+            << "\n"
+            << R"(  {"id":"3","type":"get_stats"})"
             << "\n";
 }
 
@@ -132,6 +136,8 @@ int runServer(std::uint16_t binaryPort, std::uint16_t jsonPort) {
             << "\n"
             << R"(  {"id":"2","type":"transfer","idem_key":"k1","from":"1001","to":"2002",)"
             << R"("amount":"2500","ccy":"USD"})"
+            << "\n"
+            << R"(  {"id":"3","type":"get_stats"})"
             << "\n"
             << "\n"
             << "停止：Ctrl-C\n";
