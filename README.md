@@ -1,391 +1,327 @@
 # Transactional Ledger & Settlement Engine
 
-A high-concurrency, ACID-compliant double-entry ledger written in C++20. Handles
-multi-currency account transfers over a hand-rolled epoll event loop, prevents
-double-spending under concurrent load, and guarantees that every transfer is
-recorded as a balanced pair of immutable journal entries.
+**Plain English:** this is the piece of software that sits underneath a bank or a
+payment app and actually moves the money. When you tap "send $50 to Bob", something
+has to subtract $50 from you, add $50 to Bob, write both facts down permanently,
+and make absolutely sure that nothing goes wrong if ten thousand other people are
+doing the same thing at the same instant.
 
-> **Status:** Stage 5 of 9 — the server is live. Two ports, twenty-four worker
-> threads, an in-memory ledger, and `nc` is a working client. PostgreSQL is
-> next. See [Roadmap](#roadmap) for the rest.
+That "something" is called a **ledger engine**. This project is one, built from
+scratch in a programming language called C++.
+
+> **New to this kind of software?** You are in the right place. This page explains
+> everything from the beginning and assumes no background. The deep technical
+> record — how it was built, why each decision was made, what was tested — lives in
+> a separate file, **[progress.md](progress.md)**.
 
 ---
 
-## Why this project
+## Contents
 
-Money systems fail in ways ordinary CRUD apps do not. A lost update is not a
-stale cache — it is money that no longer exists. This engine is built around
-that constraint:
+- [The problem this solves](#the-problem-this-solves)
+- [What this software promises](#what-this-software-promises)
+- [A small glossary](#a-small-glossary)
+- [How it works, in plain terms](#how-it-works-in-plain-terms)
+- [Trying it yourself](#trying-it-yourself)
+- [Talking to the engine](#talking-to-the-engine)
+- [How money is written down](#how-money-is-written-down)
+- [How we know it is correct](#how-we-know-it-is-correct)
+- [Where the project is now](#where-the-project-is-now)
 
-- **Double-entry is enforced, not documented.** Every transfer produces exactly
-  two journal entries whose amounts sum to zero. Account balances are a
-  *derived snapshot* that can always be recomputed from the immutable entry log,
-  which makes lost updates detectable rather than silent.
-- **Deadlock is prevented by construction.** Concurrent `A → B` and `B → A`
-  transfers acquire per-account locks in a strict global order, so the wait-for
-  graph is provably acyclic. Not "we tested it and it seemed fine."
-- **Durability is the acknowledgment boundary.** A client is told a transfer
-  succeeded only after PostgreSQL has committed it. In-memory state never runs
-  ahead of the database.
+---
 
-## Architecture at a glance
+## The problem this solves
+
+Imagine two things happen at the exact same moment:
+
+- Alice sends $50 to Bob.
+- Bob sends $30 to Alice.
+
+Each one is simple on its own. But a computer does not do one thing at a time —
+it does thousands of things at once, in overlapping slices. So both of these
+transfers are half-finished simultaneously, both are reading and changing the same
+two account balances, and they can trip over each other.
+
+Two specific disasters can happen, and both are silent:
+
+**1. Money disappears (or appears from nowhere.)**
+
+Suppose Alice's balance is $100. Two transfers each try to take $50.
 
 ```
-Client ──TCP──▶ IO Thread ──▶ BlockingQueue ──▶ Worker Pool ──▶ PostgreSQL 16
-                (epoll ET)      (bounded)         (20 threads)     (WAL/fsync)
-                    ▲                                   │
-                    └────── eventfd wakeup ─────────────┘
-                       (only the IO thread writes to sockets)
+Transfer A reads the balance:  $100
+Transfer B reads the balance:  $100     ← it read before A finished writing
+Transfer A writes:             $50
+Transfer B writes:             $50      ← should have been $0
 ```
 
-| Concern | Approach |
+Alice spent $100 but her account says $50. Fifty dollars was created out of thin
+air. Nothing crashed. No error message appeared. The books are simply wrong now,
+and they will stay wrong forever. In the industry this is called a **lost update**,
+and it is the reason software like this is written so carefully.
+
+**2. Everything freezes.**
+
+To change an account safely, a program "locks" it — the software equivalent of
+putting a *do not disturb* sign on a file so nobody else touches it mid-edit.
+
+Now: Alice→Bob locks Alice's account and reaches for Bob's. At the same instant,
+Bob→Alice locks Bob's account and reaches for Alice's. Each is holding what the
+other needs. Neither will ever let go. Both wait forever, and so does everyone
+queued behind them.
+
+That is called a **deadlock**, and it does not look like a crash. It looks like the
+app just… stops responding, for everyone, with no explanation.
+
+**This project's entire purpose is to make both of these impossible** — not
+"unlikely", not "we tested it and it seemed fine", but structurally impossible.
+
+---
+
+## What this software promises
+
+Nine promises, in plain language.
+
+**1. Every transfer is written down twice, and the two halves must cancel out.**
+
+This is a 700-year-old accounting practice called **double-entry bookkeeping**.
+Money is never simply "removed" — it is moved, so every movement is recorded as a
+matched pair: *−$50 from Alice* and *+$50 to Bob*. The pair must add up to exactly
+zero.
+
+Why this matters: if money ever goes missing, the two halves stop cancelling out,
+and the mismatch is immediately visible. Without it, missing money leaves no
+trace at all.
+
+**2. Balances can always be rebuilt from scratch.**
+
+Your account balance is not treated as the truth. The permanent list of every
+movement ever made is the truth, and the balance is just a running total kept for
+speed. At any moment the engine can re-add the entire history and check that the
+totals still match. If they ever disagree, something is wrong and we find out —
+rather than never knowing.
+
+**3. Money is never lost or created, no matter how busy things get.**
+
+This is tested directly: 32 simultaneous streams of activity, roughly 96,000
+transfers among 20 accounts, all at once. Afterwards, the total amount of money in
+the system must be **exactly** what it was before. Not approximately. Exactly.
+
+**4. You cannot spend money you do not have.**
+
+Even when 50 withdrawal requests hit the same account in the same instant. If the
+account holds $1,000 and everyone tries to take $100, exactly ten succeed and the
+rest are refused. Eleven successes would mean the system invented $100.
+
+**5. It cannot freeze.**
+
+The deadlock described above is prevented by a rule rather than by luck: every
+transfer always locks the lower-numbered account first, regardless of which
+direction the money is flowing. Because everyone follows the same order, nobody can
+ever be stuck waiting on someone who is waiting on them. This is proven with
+mathematics, not just tested.
+
+**6. Money is never stored as a decimal number.**
+
+Computers are famously bad at decimals — in most programming languages,
+`0.1 + 0.2` does not equal `0.3`. It equals `0.30000000000000004`. Tiny errors,
+repeated across millions of transactions, become real missing money.
+
+So this engine never stores `$50.00`. It stores `5000` — the number of *cents* —
+as a whole number. Whole numbers are exact. Formatting for display happens only at
+the very last moment.
+
+**7. Clicking "send" twice does not send twice.**
+
+Every request carries a unique ticket number. If your phone loses signal and
+retries, the engine recognises the ticket it has already processed and returns the
+original result instead of moving the money again.
+
+**8. The database enforces the rules too.**
+
+The rules are not only written into the program — they are also built into the
+storage system itself, as hard constraints. This matters because programs can be
+bypassed: someone might edit the data directly, or write a quick script to "fix"
+something. The storage layer refuses to accept broken data no matter who is asking.
+
+**9. Different currencies are handled honestly.**
+
+`5000` means **$50.00** in US dollars but **¥5,000** in Japanese yen — because the
+yen has no subdivision like cents. The engine knows this per currency and never
+assumes "divide by 100".
+
+---
+
+## A small glossary
+
+Every technical word used on this page, defined once.
+
+| Word | What it means here |
 |---|---|
-| Networking | POSIX sockets + `epoll` (edge-triggered, non-blocking), hand-written event loop |
-| Concurrency | One IO thread, 20+ worker threads, bounded MPMC task queue with backpressure |
-| Locking | Per-account `std::shared_mutex`, ordered acquisition by account id |
-| Atomics | `std::atomic` for counters, ID generation, and shutdown flags only — never balances |
-| Persistence | PostgreSQL 16 + libpqxx, `SELECT … FOR UPDATE` in matching lock order |
-| Money | `int64_t` minor units with a per-currency exponent. No floating point, anywhere |
-| Idempotency | Client-supplied key, guarded by an in-memory shard cache and a DB unique index |
-| Testing | GoogleTest units, ThreadSanitizer / AddressSanitizer, Locust load tests |
+| **Ledger** | The permanent record of every money movement. Historically a physical book. |
+| **Double-entry** | The practice of recording each movement twice — once as money leaving, once as money arriving — so the two must cancel out. |
+| **Account** | A container holding a balance in one specific currency. Alice has a dollar account and a yen account; they are separate. |
+| **Balance** | How much is in an account right now. |
+| **Entry** | One half of a movement: "−$50 from account 1001". |
+| **Transaction** | A complete movement: two matched entries that cancel out. |
+| **Transfer** | A request to move money. It becomes a transaction once accepted. |
+| **Server** | A program that runs continuously, waiting for other programs to send it requests. This engine is a server. |
+| **Client** | Anything that sends requests to a server. A phone app, a website, or a person typing commands. |
+| **Port** | A numbered doorway on a computer. One machine can run many servers; port numbers keep them apart. This one uses doorways 9000 and 9001. |
+| **Protocol** | The agreed format for messages, so both sides understand each other. Like agreeing to speak English before a phone call. |
+| **Concurrency** | Many things happening at overlapping times. The source of nearly every hard problem in this project. |
+| **Thread** | One stream of work inside a program. This engine runs 24 of them side by side, so 24 transfers can be processed at once. |
+| **Lock** | A *do not disturb* marker on a piece of data, so two threads cannot change it simultaneously. |
+| **Deadlock** | Two threads each holding what the other needs, both waiting forever. |
+| **Race condition** | A bug that only appears depending on the split-second timing of overlapping work — so it may show up once in ten million times, and never while you are watching. |
+| **Backpressure** | When a system is overloaded, politely saying "I am full, try again shortly" instead of accepting work it cannot do. |
+| **Idempotency** | The property that doing something twice has the same effect as doing it once. |
+| **Invariant** | A statement that must be true at all times, forever. "Total money never changes on its own" is one. |
+| **Database** | Software specialising in storing data safely and permanently, even if the power is cut. This project uses one called PostgreSQL. |
+| **Container** | A packaged mini-computer-inside-your-computer, so software runs identically on any machine. This project uses Docker for that. |
+| **Compiler** | A program that translates human-written source code into something the machine can actually execute. |
 
-The full design — module boundaries, thread model, the deadlock proof, the
-schema, and the three persistence strategies that were evaluated — is in
-**[`docs/stage-0-architecture.md`](docs/stage-0-architecture.md)** (written in
-Traditional Chinese).
+---
 
-## Supported currencies
+## How it works, in plain terms
 
-`USD` · `EUR` · `JPY` · `GBP` · `CNY` · `TWD`
+Think of a busy restaurant.
 
-Amounts are stored as `int64_t` in each currency's minor unit. `JPY` has an
-exponent of **0** while the rest have **2**, so the same stored value of `5000`
-means `$50.00` in USD but `¥5,000` in JPY. Every format and parse path consults
-the currency table; nothing divides by 100.
+```
+   Customer          Waiter            Order queue        Kitchen           Recipe book
+     (app)        (one person)       (limited size)    (24 cooks)         (the ledger)
 
-Both legs of a transfer must share a currency. FX is out of scope for v1 and
-would be modeled as two same-currency transactions through an FX position
-account rather than a single mixed-currency entry pair.
+  request ──────▶  takes it down  ──▶  ticket rail  ──▶  cooks it  ──▶  writes it down
+                        ▲                                     │
+                        └───────── plates come back ──────────┘
+                             (only the waiter serves tables)
+```
 
-## Requirements
+- **One waiter takes every order.** A single part of the program handles all
+  incoming and outgoing messages. Having one waiter sounds slow, but they never
+  cook — they only take orders and deliver plates, which is fast. And because only
+  one person carries plates, two dishes can never collide on the way to a table.
+- **Orders go on a rail with limited space.** If the rail is full, the waiter says
+  "sorry, we are slammed, try in a moment" rather than accepting an order that will
+  never be cooked. A queue that grows forever is worse than an honest refusal:
+  customers end up waiting an hour for food they no longer want.
+- **24 cooks work in parallel.** They do the actual work simultaneously, which is
+  where the speed comes from.
+- **Two cooks never touch the same pan.** Before changing an account, a cook claims
+  it. And everyone claims accounts in the same fixed order, which is what makes the
+  freeze-forever scenario impossible.
+- **Everything is written in the recipe book, permanently.** Entries are never
+  edited or erased — corrections are added as new entries, exactly like real
+  accounting.
 
-Requirements grow with the stages, so you do not need everything on day one:
+The engine also speaks in two different formats through two different doorways:
 
-| What you want to run | What you need |
+| Doorway | Format | Who it is for |
+|---|---|---|
+| **Port 9000** | Compact, machine-optimised | Real applications, at high speed |
+| **Port 9001** | Readable text, one line per message | Humans. You can literally type at it and read the replies |
+
+Both doorways understand exactly the same commands. The second exists purely so a
+person can look inside and see what the engine is doing.
+
+---
+
+## Trying it yourself
+
+You do not need to understand the code to run it. Every command below is explained.
+
+### What you need
+
+| To do this | You need |
 |---|---|
-| Ledger core and its tests (stages 1–3) | A C++20 compiler and CMake 3.22+. Any platform — macOS included |
-| Schema checks (stage 2) | Also a PostgreSQL 16, native or containerized |
-| The TCP server (stages 4+) | Linux, because `epoll` has no macOS equivalent |
+| Run the correctness tests | A C++ compiler and a build tool called CMake. Works on Mac, Linux, or Windows |
+| Try the storage layer | Also PostgreSQL (a database), either installed directly or via Docker |
+| **Run the live server** | **Linux** — or Docker on a Mac, which provides Linux inside a container |
 
-`epoll` is Linux-only, but that constraint belongs to the networking layer
-alone. The ledger core — accounts, ordered lock acquisition, `shared_mutex` —
-is plain standard C++20 and builds and runs natively on macOS, sanitizers
-included. Only the socket layer needs a container.
+Why the server needs Linux: it uses a high-speed networking feature called `epoll`
+that only exists on Linux. Everything else in the project runs anywhere.
+
+If you are unsure what is installed on your machine, this command checks and tells
+you plainly:
 
 ```bash
-make doctor      # reports what is installed and what each stage needs
+make doctor
 ```
 
-## Quick start
+### Step 1 — Get the code
 
 ```bash
 git clone https://github.com/<your-username>/ledger-engine.git
 cd ledger-engine
-
-make test        # configure, build, run the test suite — no Docker needed
 ```
 
-Expected output:
+The first line downloads the project. The second moves you into its folder.
 
-```
-100% tests passed, 0 tests failed out of 56
-```
-
-For the schema checks, pick whichever PostgreSQL is easier for you. The
-Makefile detects Docker and falls back to a native install, so the commands are
-the same either way.
+### Step 2 — Run the tests
 
 ```bash
-# Option A — Docker (also gives you the Linux container for stages 4+)
+make test
+```
+
+This compiles the project and then runs its full self-check suite — 151 separate
+tests, including ones that launch dozens of simultaneous transfers to try to break
+the accounting on purpose. It needs nothing installed beyond a compiler.
+
+You should finish with a line saying all tests passed. That single line is the
+project's core claim: money is conserved, overdrafts are impossible, and nothing
+deadlocks.
+
+### Step 3 — Start the database (optional)
+
+```bash
 make up
+```
 
-# Option B — native PostgreSQL, no Docker
-brew install postgresql@16 && brew services start postgresql@16
-make db-native-setup
+This starts PostgreSQL inside a container, along with a Linux environment for
+running the server. Then:
 
-# Either way:
+```bash
 make db-all
 ```
 
-`make help` lists every available target.
+This wipes and rebuilds the storage structure, loads sample accounts, and runs 22
+checks that deliberately try to store *invalid* data — a transfer that does not
+balance, a movement between mismatched currencies, an attempt to edit history. All
+22 must be rejected. If any is accepted, that is a bug.
 
-## The schema enforces the ledger, not just stores it
+### Step 4 — Start the engine
 
-Most of the double-entry rules live in the database rather than in application
-code, because application code can be bypassed — by a stray `psql` session, a
-data-fixing script, or a new code path that forgot to check.
-
-| Rule | How it is enforced |
-|---|---|
-| A transaction has exactly two entries summing to zero | `DEFERRABLE INITIALLY DEFERRED` constraint trigger, checked at `COMMIT` |
-| Both legs share a currency | Composite FK to `accounts (id, currency)` — a cross-currency row has no parent to reference |
-| An entry's currency matches its account | Same composite FK, from `entries` |
-| The audit trail is immutable | `BEFORE UPDATE`/`BEFORE DELETE` triggers reject every mutation on `entries` |
-| A resent request cannot double-charge | `UNIQUE (idempotency_key)` on `transactions` |
-| A user balance cannot go negative | `CHECK (allow_negative OR balance >= 0)` |
-| An account cannot transfer to itself | `CHECK (debit_account_id <> credit_account_id)` |
-
-The deferred trigger is the interesting one. `CHECK` constraints see a single
-row, but "these two rows sum to zero" spans rows — and the two entries arrive in
-separate `INSERT`s, so an immediate check would fire while the transaction is
-legitimately half-written. Deferring it to commit time is what makes the rule
-expressible at all.
+On a Mac, go into the Linux container first:
 
 ```bash
-make db-all      # reset schema, load seed, run 22 constraint tests, check invariants
-make db-check    # invariant health check on whatever data is currently there
-make psql        # interactive session
+make shell
 ```
 
-`make db-test` writes deliberately invalid data 22 different ways and asserts
-the database rejects every one. `make db-check` asks the opposite question — is
-the data that is already there still consistent? Constraints only catch the
-error shapes they know about; a lost update writes rows that are individually
-valid and only wrong in relation to each other, which is why **I2** compares
-each balance snapshot against the sum of its entries.
+Then, inside it:
 
-## How the locking works
-
-A transfer touches two accounts, so it takes two locks. Which order it takes
-them in is the whole design.
-
-```cpp
-if (req.from == req.to) return ErrorCode::SelfTransfer;  // before any lock
-
-Account* lo = from;
-Account* hi = to;
-if (lo->id() > hi->id()) std::swap(lo, hi);   // always ascending account id
-
-std::unique_lock loGuard(lo->mutex);
-std::unique_lock hiGuard(hi->mutex);
-// check balance and apply it, both inside this one critical section
+```bash
+cmake -S . -B build && cmake --build build -j
+./build/src/ledger_engine
 ```
 
-Locking in the request's own direction deadlocks: a thread moving 1001 → 2002
-holds 1001 and waits for 2002 while a thread moving 2002 → 1001 holds 2002 and
-waits for 1001. Sorting by account id means both threads take 1001 first, so
-the second one blocks while **holding nothing** — it cannot become anyone's
-blocker, and the wait-for graph stays acyclic. That is a proof, not a heuristic:
-along any cycle the ids would have to increase strictly and still return to the
-start.
+(On Linux you can skip the container and simply run `make run`.)
 
-The self-transfer guard has to come first. Without it `lo` and `hi` are the same
-account, the same non-recursive mutex gets locked twice, and the thread wedges
-itself — undefined behavior that presents as a random hang.
-
-One inversion is deliberate. `auditMutex_` is taken **shared by transfers**
-(which write) and **exclusive by audits** (which read). It does not protect a
-variable; it protects the property "no transfer is in flight". Transfers already
-exclude each other through the account locks, so they pay nothing, while an
-audit gets a genuinely consistent cross-account snapshot instead of account A's
-new balance beside account B's old one.
-
-## What the concurrency tests actually prove
-
-Concurrency bugs are the ones that usually don't happen. So the tests generate
-real contention and then check properties that hold no matter how the threads
-interleave.
-
-| Test | What it would catch |
-|---|---|
-| `TotalMoneyIsConserved` | 32 threads, 96k transfers over 20 accounts. Total per currency must be **exactly** unchanged. A lost update shows up as money appearing or vanishing |
-| `ConcurrentWithdrawalsCannotOverdraw` | One account holds 1000, everyone withdraws 100. Exactly 10 succeed — 11 would mean money created from nothing |
-| `OppositeDirectionTransfersDoNotDeadlock` | 32 threads, two accounts, 640k opposing transfers. Deadlock presents as a hang, caught by the ctest timeout |
-| `AuditSeesConsistentSnapshotDuringTraffic` | Every audit taken mid-traffic must see the correct total |
-| `RegistryGrowthDoesNotInvalidatePointers` | 20k accounts created while transfers run. Rehashing must not invalidate a live `Account*` |
-
-These were checked against deliberately broken builds, because a test that
-cannot fail proves nothing:
-
-- Removing the `std::swap` deadlocks within 30 seconds.
-- Downgrading the account locks to `shared_lock` loses 8081 units out of
-  20,000,000 and trips both the conservation check and the I2 recompute.
-
-Both sanitizer builds are clean: no data races under ThreadSanitizer, no
-use-after-free or undefined behavior under AddressSanitizer/UBSan.
-
-## The two rules that make edge-triggered epoll work
-
-`epoll` in edge-triggered mode reports a fd only when its state *changes*.
-That makes it cheaper than level-triggered, and it makes two mistakes fatal in
-a way that small tests never reveal.
-
-**Drain every readable fd until `EAGAIN`.** If you stop early, the remaining
-bytes sit in the kernel buffer, the state never changes again, and epoll never
-notifies you. That connection goes permanently silent: the client waits for a
-response, the server believes no request arrived. The same rule applies to
-`accept()` — stop early and a connection sits in the backlog forever, its
-handshake already complete.
-
-**Handle short writes.** When the kernel send buffer fills, `write()` returns
-`EAGAIN`. The rest of the response has to stay buffered while you register
-`EPOLLOUT` and wait to be told the socket is writable again — and you must
-deregister it once drained, or a permanently-writable socket spins the loop at
-100% CPU.
-
-Both bugs are invisible below the read-chunk size and under fast clients. The
-tests therefore push 1 MB through a single read event and make a client stop
-reading mid-response.
-
-Writes are funnelled through the loop thread for a separate reason: two threads
-calling `write()` on one socket interleave their bytes, the length prefix stops
-lining up, and the protocol desynchronises. That is not a data race — `write()`
-is thread-safe — so ThreadSanitizer will never flag it. `Connection::send()` is
-callable from any thread and hands the actual write to the loop via an
-`eventfd` wakeup.
-
-## What Stage 4's tests prove
-
-| Test | What it would catch |
-|---|---|
-| `EdgeTriggeredReadDrainsTheEntireSocket` | 1 MB through one read event. A missing drain loop delivers ~131 KB and then hangs |
-| `HandlesPartialWritesWhenClientStopsReading` | Client stops reading mid-response. Without `EPOLLOUT` the tail is silently dropped |
-| `ServesManyConcurrentClients` | 50 clients × 20 round-trips on one loop thread |
-| `SurvivesAbruptDisconnects` | 200 connect-then-immediately-close cycles. Catches fd leaks |
-| `ReadsDataSentImmediatelyBeforeClose` | Data sent just before `FIN` must not be dropped — read has to be handled before hangup |
-| `RunInLoopHandlesManyCrossThreadTasks` | 2000 tasks from 8 threads, none lost |
-
-Checked against broken builds, as in earlier stages:
-
-- Reading once instead of draining: 131,018 of 1,048,576 bytes arrive, then the
-  connection stalls until the test times out.
-- Skipping the `EPOLLOUT` registration: 3,994,597 of 4,194,304 bytes arrive.
-
-The second one is worth a note. The first version of that test passed *even
-with the bug present*, because the client was still streaming data and every
-read event happened to re-drive the write path. The test was being rescued by
-traffic it did not control. Adding a 300 ms pause after the client stops sending
-is what made it actually test the thing it claimed to test.
-
-ThreadSanitizer also caught three real races in this stage that reading the code
-had not: `EventLoop::threadId_`, `Acceptor::accepted_`, and reading
-`connections_.size()` from outside the loop thread. All three are now atomic.
-
-## One field declaration, two encodings
-
-The server speaks two protocols: a length-prefixed binary frame on port 9000,
-and newline-delimited JSON on port 9001 so that `nc` is a usable debugging
-client. Supporting both by hand would mean writing every message field four
-times — binary encode, binary decode, JSON encode, JSON decode. Adding a field
-and forgetting one of the four is a silent failure: it compiles, that
-encoding's tests pass, and only the *other* encoding is quietly missing a field.
-
-Instead each message declares its fields exactly once:
-
-```cpp
-static constexpr auto fields() {
-  return std::tuple{
-      Field{"idem_key", &TransferReq::idemKey},
-      Field{"from",     &TransferReq::from},
-      Field{"amount",   &TransferReq::amount},
-      Field{"ccy",      &TransferReq::ccy},
-  };
-}
-```
-
-Both codecs walk that tuple and dispatch on the field type, so each one only
-implements five primitives rather than one function per message. A field type
-with no dispatch arm is a `static_assert`, not a silently skipped field.
-
-**Every integer crosses the JSON boundary as a string.** JavaScript numbers are
-IEEE-754 doubles, so `JSON.parse('{"amount":9007199254740993}')` returns
-9007199254740992 — no error, no warning, one cent gone. Bare numbers in integer
-fields are rejected outright rather than accepted while the values happen to be
-small. Protobuf's canonical JSON mapping made the same call for the same reason.
-
-The trade-off is that reordering `fields()` silently changes the binary layout
-while leaving JSON untouched, and round-trip tests cannot see it — encoder and
-decoder change together and stay consistent with each other. That is what the
-byte-level golden table in `test_codec.cpp` is for; it doubles as the protocol
-specification.
-
-## Backpressure, and two different ways to stop
-
-Work reaches the workers through a bounded queue. Bounded is the point: an
-unbounded queue responds to a slow database by growing without limit and by
-queueing requests whose clients timed out long ago. Both are worse than saying
-no. The IO thread therefore only ever calls `tryPush`, and turns a refusal into
-a `SERVER_BUSY` response — an event loop that blocks stalls *every* connection,
-not just the one that was unlucky.
-
-Shutdown needs two distinct meanings, so it gets two mechanisms:
-
-| | Effect |
-|---|---|
-| `close()` | Refuse new work, but finish what is already queued — those clients are still waiting for an answer |
-| `stop_token` | Abandon the queue immediately |
-
-Workers are `std::jthread` blocked in
-`condition_variable_any::wait(lock, stop_token, pred)`, so `request_stop()`
-wakes them with nobody having to remember to notify, and the destructor cannot
-leave a thread behind.
-
-Handlers are an abstract interface owned by `unique_ptr`, not `std::function`.
-Stage 6 handlers will hold a `pqxx::connection`, which is move-only, and
-`std::function` requires its target to be copyable. The factory runs *on* the
-worker thread, so each database connection is created, used, and destroyed on
-one thread and needs no lock at all.
-
-## What Stage 5's tests prove
-
-| Test | What it would catch |
-|---|---|
-| `CodecGolden.*` | Byte-level layout of every message. Reordering `fields()` breaks binary compatibility silently; round-trip tests cannot see it |
-| `CodecInt64.ValuesBeyondDoublePrecisionSurvive` | 2⁵³+1 through both codecs |
-| `CodecInt64.JsonRejectsBareNumbers` | An unquoted integer is an error, not a lucky small value |
-| `FrameSplitter*.OversizedLengthIsRejectedImmediately` | A client sending `len = 0xFFFFFFFF` and then going quiet must not make us wait forever |
-| `BlockingQueue.TryPushNeverBlocksWhenFull` | 10,000 rejected pushes must take microseconds, not block |
-| `BlockingQueue.CloseWakesEveryBlockedConsumer` | `notify_one` instead of `notify_all` leaves threads asleep and `join()` never returns |
-| `ThreadPool.DiscardsResultWhenSinkIsGone` | A client that disconnects while its request is queued |
-| `ThreadPool.EachWorkerGetsItsOwnHandler` | The precondition for one database connection per worker |
-
-Checked against broken builds, as in earlier stages:
-
-- `notify_all` → `notify_one` in `close()`: the process hangs forever with no
-  output at all and is killed by the ctest timeout.
-- `tryPush` → blocking `push` in `submit()`: 200 submissions take **9,780 ms**
-  instead of under 1 ms.
-
-The first one is why `gtest_discover_tests` sets a timeout. A missed
-notification and a lock-order deadlock both manifest as *never returning*, not
-as a failed assertion — the assertion never gets a chance to run, so the
-timeout is the only thing that can judge them.
-
-## Talking to it
-
-The JSON port exists so that the server can be driven by hand. Start it and
-point `nc` at port 9001:
+You will see:
 
 ```
-$ ./build/src/ledger_engine
 ledger engine up
   binary  port 9000  (length-prefixed)
   json    port 9001  (NDJSON, one object per line)
   workers 20 binary / 4 json (independent queues)
   accounts 5 loaded
-
-$ nc localhost 9001
-{"id":"1","type":"get_account","account_id":"1001"}
-{"balance":"115000","ccy":"USD","id":"1001","status":"ACTIVE","type":"account","v":1}
-
-{"id":"2","type":"transfer","idem_key":"k1","from":"1001","to":"2002","amount":"2500","ccy":"USD"}
-{"from_balance":"112500","id":"2","to_balance":"49500","tx_id":"900004","type":"transfer_ok","v":1}
-
-{"id":"3","type":"transfer","idem_key":"k2","from":"2002","to":"1001","amount":"99999999","ccy":"USD"}
-{"code":"INSUFFICIENT_FUNDS","id":"3","message":"INSUFFICIENT_FUNDS","type":"error","v":1}
 ```
 
-Ctrl-C prints what the run did and re-checks the ledger:
+The engine is now running and waiting. It has loaded five demo accounts.
+
+### Step 5 — Stop it
+
+Press **Ctrl-C**. It finishes any work already in progress, then reports what
+happened and re-checks its own books:
 
 ```
 stopped.
@@ -394,136 +330,259 @@ stopped.
   invariants passed — the ledger balances
 ```
 
-The demo accounts are the ones from the design document and from
-`db/seeds/dev_seed.sql`: Alice at 115000 USD, Bob at 47000, and a JPY account
-holding 5000 — which is ¥5,000, not ¥50.00, because JPY has exponent 0. They
-are created by transferring out of a system account rather than by setting
-balances directly, so I2 holds from the very first row. Stage 6 replaces that
-function with `SELECT id, balance FROM accounts` and the same commands should
-produce the same answers.
+That last line is the engine confirming that every account balance still matches
+the sum of its recorded history.
 
-## Two kinds of protocol failure
+---
 
-Turning a byte stream into requests means deciding what to do when the bytes
-are wrong, and there are two different answers:
+## Talking to the engine
 
-| | What it means | What to do |
-|---|---|---|
-| **Decode error** | The frame boundary is known, the contents are not understood | Reply with an error, skip that one message, keep the connection |
-| **Framing error** | The length field is nonsense, or a line never ends — the stream can no longer be aligned | Reply, then close the connection |
-
-Treating a framing error as recoverable puts the connection into a loop:
-garbage in, error out, more garbage in. There is no way to find where the next
-message starts, so continuing to read only produces more noise.
-
-Connection lifetime has a matching pair of rules, and both directions have to
-be weak:
-
-```
-LedgerServer::connections_ ──shared──▶ Connection
-                                          │  the read callback captures shared
-                                          ▼
-                                   ConnectionContext
-                                          │  weak  ←── must not be shared
-                                          ▼
-                                     Connection
-```
-
-A `shared_ptr` back to the `Connection` would be a reference cycle: the count
-never reaches zero and every closed connection leaks its fd and its buffers.
-That failure never crashes — the process just grows, and only a long load test
-notices. In the other direction each queued `Task` holds the context weakly, so
-a client that disconnects while its transfer is still queued gets its result
-discarded rather than written to a dead socket.
-
-## What Stage 5c's tests prove
-
-Eighteen of these use real sockets against a real server with real worker
-threads. The most useful one is `ConcurrentClientsPreserveTotalMoney`: eight
-clients, half transferring 1001→2002 and half 2002→1001 — precisely the pattern
-that deadlocks a naive lock-the-source-first implementation. It exercises the
-event loop, both codecs, the queue, the ordered locking, and the response
-routing at once, and then asserts that the two balances still sum to what they
-did before. Every fixture teardown re-checks the invariants.
-
-`SurvivesClientsDisconnectingMidFlight` fires fifty requests and hangs up
-without reading any of them. `FramingErrorClosesTheConnection` sends
-`len = 0xFFFFFFFF` and expects a FIN. `GarbageLineGetsAnErrorButKeepsTheConnection`
-sends nonsense and then a valid ping on the same socket.
-
-None of `net/` changed in this stage. The event loop, the acceptor, the
-connection, and the buffer are byte-for-byte what Stage 4 delivered — which was
-the point of building the echo server without a protocol in the first place.
-
-## Development
+Open a second terminal window and connect to the human-readable doorway. `nc` is a
+small tool that lets you type text directly at a server:
 
 ```bash
-make build        # configure + compile
-make test         # compile + ctest
-make tsan         # ThreadSanitizer build + tests
-make asan         # AddressSanitizer + UBSan build + tests
-make fmt          # clang-format in place
-make fmt-check    # verify formatting without modifying (used by CI)
-make clean        # remove build directories
+nc localhost 9001
 ```
 
-PostgreSQL is exposed on host port **5433** to avoid colliding with a local
-install on 5432:
+Now you can type commands. Each one is a single line. The engine answers with a
+single line.
 
-```bash
-psql postgresql://ledger:ledger_dev_password@localhost:5433/ledger
+> **Note:** if you are running the engine inside Docker on a Mac, run this from
+> *inside* the container (`make shell`), because doorway 9001 is not yet opened to
+> the outside world. Fixing that is on the roadmap.
+
+### Command 1 — "Are you alive?"
+
+```json
+{"id":"1","type":"ping"}
 ```
 
-Credentials in `docker-compose.yml` are development-only and are not used
-anywhere else.
+Reply:
 
-### Building on both platforms is a test in itself
+```json
+{"id":"1","type":"pong","v":1}
+```
 
-Everything except `net/` builds and runs natively on macOS. `net/` needs
-`epoll`, `eventfd`, and `accept4`, so it is compiled only on Linux and the
-server has to run in the container. The core, the money types, the protocol
-layer, and the thread pool are all platform-independent on purpose — they are
-the parts that need the fastest edit-compile-test loop.
+`type` is what you are asking for. `id` is a label you choose, echoed back so you
+can match replies to requests when several are in flight. `v` is the version of the
+message format.
 
-Keeping that second platform alive costs a little and has already paid for
-itself. `main.cpp` parsed `--port` and then only read it inside the
-`LEDGER_HAS_EPOLL` branch, so on macOS the variable was written and never read.
-AppleClang's `-Wunused-but-set-variable` plus `-Werror` rejected the build. The
-Linux CI could never have seen it: on Linux the variable *is* read.
+### Command 2 — "What is in account 1001?"
 
-Two compilers disagreeing is information. A warning that only one of them
-raises is usually pointing at a code path the other one never compiles.
+```json
+{"id":"2","type":"get_account","account_id":"1001"}
+```
 
-## Roadmap
+Reply:
 
-| Stage | Deliverable | Status |
-|---|---|---|
-| 0 | Architecture design, module split, thread model | ✅ Done |
-| 1 | Project skeleton, CMake, Docker Compose | ✅ Done |
-| 2 | DB schema: `currencies` / `accounts` / `transactions` / `entries` | ✅ Done |
-| 3 | Ledger core — in-memory, `shared_mutex`, no DB yet | ✅ Done |
-| 4 | epoll TCP server (echo first) | ✅ Done |
-| 5 | Wire protocol framing + thread pool | ✅ Done |
-| 6 | PostgreSQL integration with `SELECT … FOR UPDATE` | ⬜ Next |
-| 7 | ThreadSanitizer / AddressSanitizer verification | ⬜ |
-| 8 | Locust load tests, tuning, TPS and p95 numbers | ⬜ |
-| 9 | Architecture diagrams, final documentation | ⬜ |
+```json
+{"balance":"115000","ccy":"USD","id":"1001","status":"ACTIVE","type":"account","v":1}
+```
 
-## Invariants under test
+Reading it: account 1001 holds `115000` — and since this is US dollars, that means
+**$1,150.00**. `ccy` is short for currency. The account is active, not closed.
 
-These are asserted by the test suite, not just described here:
+### Command 3 — "Move $25.00 from account 1001 to account 2002"
 
-| | Invariant |
+```json
+{"id":"3","type":"transfer","idem_key":"k1","from":"1001","to":"2002","amount":"2500","ccy":"USD"}
+```
+
+Reply:
+
+```json
+{"from_balance":"112500","id":"3","to_balance":"49500","tx_id":"900004","type":"transfer_ok","v":1}
+```
+
+What each part means:
+
+| Part | Meaning |
 |---|---|
-| **I1** | Every transaction's entries sum to zero |
-| **I2** | Every account balance equals the sum of its entries — catches lost updates |
-| **I3** | Total money per currency is conserved across 32 threads and 100k concurrent transfers |
-| **I4** | No user account balance goes negative under concurrent load — no double-spending |
-| **I5** | The same idempotency key always yields the same transaction, applied once |
+| `idem_key` | Your unique ticket number for this request. Send the same one twice and the money moves only once |
+| `from` / `to` | Which accounts. They must be different, and both must hold the same currency |
+| `amount` | `2500` = **$25.00**, expressed in cents |
+| `ccy` | The currency |
+| `tx_id` | The engine's permanent reference number for this transaction |
+| `from_balance` / `to_balance` | The two new balances — $1,125.00 and $495.00 |
 
-I3 is the load-bearing one: it is the assertion that a race condition cannot
-hide behind.
+### Command 4 — Try to spend money that is not there
+
+```json
+{"id":"4","type":"transfer","idem_key":"k2","from":"2002","to":"1001","amount":"99999999","ccy":"USD"}
+```
+
+Reply:
+
+```json
+{"code":"INSUFFICIENT_FUNDS","id":"4","message":"INSUFFICIENT_FUNDS","type":"error","v":1}
+```
+
+Refused. This is the check that stops money being spent twice, and it is the single
+most important refusal the engine makes.
+
+Other refusals you might see, in plain words:
+
+| What comes back | What went wrong |
+|---|---|
+| `INSUFFICIENT_FUNDS` | Not enough money in the source account |
+| `ACCOUNT_NOT_FOUND` | No account with that number |
+| `SELF_TRANSFER` | You tried to send money from an account to itself |
+| `CURRENCY_MISMATCH` | The two accounts hold different currencies. This engine does not do currency exchange |
+| `INVALID_AMOUNT` | The amount was zero or negative |
+| `SERVER_BUSY` | The engine is at capacity. Wait a moment and retry — this is the honest refusal, not a failure |
+| `INTEGER_NOT_STRING` | You sent a number without quotation marks. See the warning below |
+| `MISSING_FIELD` | A required piece of the message was left out |
+
+### One rule if you are writing your own client
+
+**Always put quotation marks around numbers.** Write `"amount":"2500"`, never
+`"amount":2500`.
+
+The reason: many programming languages, JavaScript in particular, cannot hold very
+large whole numbers precisely. Feed one in and it silently comes back slightly
+changed — no error, no warning, just a different number. For money, that is a cent
+quietly vanishing. Sending numbers as text sidesteps the problem entirely, so the
+engine rejects unquoted numbers rather than accepting them while they happen to be
+small enough to survive.
+
+The exact message formats, including the compact one used on doorway 9000, are
+documented in [progress.md](progress.md#appendix-d--protocol-reference).
+
+---
+
+## How money is written down
+
+The engine supports six currencies: **USD, EUR, JPY, GBP, CNY, TWD**.
+
+Amounts are always whole numbers of the smallest unit of that currency:
+
+| Currency | Smallest unit | `5000` means |
+|---|---|---|
+| USD, EUR, GBP, CNY, TWD | cent (or equivalent) | `$50.00` |
+| **JPY** | the yen itself — there is no smaller unit | **`¥5,000`** |
+
+This is why the engine never simply divides by 100. It looks up each currency and
+formats accordingly. If you build anything on top of this, do the same.
+
+Both sides of a transfer must use the same currency. Converting between currencies
+is deliberately out of scope: a proper exchange involves rates, timing, and a
+separate holding account, and pretending otherwise is how real systems end up with
+untraceable money.
+
+### The demo accounts
+
+The running engine starts with five accounts:
+
+| Number | Owner | Currency | Starts with | In readable form |
+|---|---|---|---|---|
+| `1001` | Alice | USD | `115000` | $1,150.00 |
+| `2002` | Bob | USD | `47000` | $470.00 |
+| `1003` | Alice | JPY | `5000` | ¥5,000 |
+| `9001` | the system | USD | — | where dollars enter the system |
+| `9002` | the system | JPY | — | where yen enter the system |
+
+The two "system" accounts exist because money cannot simply appear. Even the
+starting balances are created by transferring *out of* a system account, so every
+single cent in the system has a matched pair of records behind it — right from the
+very first one.
+
+---
+
+## How we know it is correct
+
+Claiming software is correct is easy. Here is what actually backs it up.
+
+**Tests that try to break it on purpose.** Not "does a transfer work" — anyone can
+pass that. The suite runs 32 simultaneous streams performing tens of thousands of
+transfers among the same handful of accounts, deliberately including the exact
+pattern that causes the freeze-forever bug, and then checks that the total amount
+of money is unchanged to the penny.
+
+**Breaking the code deliberately, to prove the tests can catch it.** A test that
+cannot fail proves nothing. So each safety mechanism was removed one at a time to
+confirm the alarm actually sounds. For example, removing the rule that orders lock
+acquisition froze the system within 30 seconds. Weakening the account locks lost
+**8,081 units out of 20,000,000** — a loss of four-hundredths of one percent, the
+kind of slow bleed that would never be noticed in casual testing, and exactly the
+kind that destroys a real financial system.
+
+**Specialised bug-hunting tools.** Two tools called ThreadSanitizer and
+AddressSanitizer instrument the program while it runs and detect timing bugs and
+memory bugs that ordinary testing cannot see. Both report the code clean. They
+found three genuine timing bugs during development that careful human review had
+missed.
+
+**Automated checking on every change.** Every time the code is modified, the full
+test suite and both bug-hunting tools run automatically. Nothing gets in without
+passing.
+
+**The five promises, checked continuously:**
+
+| | The promise |
+|---|---|
+| **I1** | Every transaction's two halves cancel out exactly |
+| **I2** | Every balance equals the sum of that account's history — this is what catches money quietly going missing |
+| **I3** | Total money per currency never changes on its own, even under heavy simultaneous load |
+| **I4** | No ordinary account can go below zero, no matter how many withdrawals arrive at once |
+| **I5** | The same ticket number always produces the same result, applied only once |
+
+---
+
+## Where the project is now
+
+The engine works today. You can start it, connect to it, move money, and watch it
+refuse invalid requests. What it cannot yet do is **remember anything after being
+switched off** — right now everything lives in memory only. That is the next major
+piece of work.
+
+| Step | What it delivers | Status |
+|---|---|---|
+| 0–5 | Design, build setup, storage structure, the accounting core, the networking layer, the message formats | ✅ Done |
+| 10 | The engine reports its own live statistics | ⬜ **Next** |
+| 11 | A bridge so a web browser can talk to it | ⬜ |
+| 12 | **A visual dashboard** — watch balances change, transfers arrive, and the safety mechanisms work, live in a browser | ⬜ |
+| 6 | Permanent storage, so nothing is lost on restart | ⬜ |
+| 7 | Re-verifying all the safety guarantees against permanent storage | ⬜ |
+| 8 | Performance measurement and tuning | ⬜ |
+| 9 | Final diagrams and documentation | ⬜ |
+
+The numbering looks out of order because it is. Steps 0–9 were the original plan;
+steps 10–12 were added afterwards, and are being done **first**. The reason: right
+now, the only proof this engine works is a line of test output. The dashboard turns
+that into something anyone can watch happening. Building it before permanent
+storage also means the dashboard is already running when storage is added
+underneath — so that change becomes something you can *see* work, rather than
+something you have to take on faith.
+
+---
+
+## Learning more
+
+- **[progress.md](progress.md)** — the complete engineering record. Every step,
+  what it delivered, how it was built, the reasoning behind each decision, what the
+  tests prove, and the full technical message reference. Written for a technical
+  reader.
+- **[docs/stage-0-architecture.md](docs/stage-0-architecture.md)** — the original
+  design document (in Traditional Chinese).
+
+### Every command, in one place
+
+```bash
+make doctor     # check what is installed on your machine, and what is missing
+make test       # compile and run the full self-check suite
+make up         # start the database and the Linux container
+make shell      # step inside the Linux container
+make run        # start the engine (Linux only)
+make db-all     # rebuild storage, load samples, run 22 rejection checks
+make db-check   # verify the stored data is still internally consistent
+make psql       # open the database directly, for a look around
+make down       # shut the containers down
+make clean      # delete compiled files
+make help       # list everything
+```
+
+---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — free to use, modify, and distribute. See [LICENSE](LICENSE).
